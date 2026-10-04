@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <link rel="icon" type="image/svg+xml" href="/logo.svg" />
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description"
+    content="TruthLens — forensic analysis for images and video. Detect AI-generated media and deepfakes with transparent, measurable signal-forensics checks." />
+  <title>TruthLens — Know what's real.</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Courier+Prime:ital,wght@0,400;0,700;1,400&family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700;9..144,800&family=Spectral:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400&display=swap"
+    rel="stylesheet" />
+  <script>
+    // Apply saved theme before first paint to avoid a flash of the wrong palette.
+    try {
+      var t = localStorage.getItem("truthlens-theme");
+      if (t === "dark" || (!t && window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches)) {
+        document.documentElement.classList.add("dark");
+      } else {
+        document.documentElement.classList.add("light");
+      }
+    } catch (e) {
+      document.documentElement.classList.add("light");
+    }
+  </script>
+  <script type="module" crossorigin src="/assets/index-D0g_yCjf.js"></script>
+  <link rel="modulepreload" crossorigin href="/assets/react-vendor-CWcBGOK2.js">
+  <link rel="modulepreload" crossorigin href="/assets/framer-motion-i7nd1XFy.js">
+  <link rel="modulepreload" crossorigin href="/assets/radix-ui-Dbha7s14.js">
+  <link rel="modulepreload" crossorigin href="/assets/charts-DUOzEPZd.js">
+  <link rel="stylesheet" crossorigin href="/assets/index-Bm32BQaL.css">
+</head>
+
+<body>
+  <div id="root"></div>
+</body>
+
+</html>
