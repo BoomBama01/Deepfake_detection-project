@@ -8,7 +8,7 @@
  */
 import { v } from "convex/values";
 import { getAuthUserId } from "@convex-dev/auth/server";
-import { internalMutation, mutation, query } from "./_generated/server";
+import { internalMutation, mutation, query, internalQuery } from "./_generated/server";
 import type { MutationCtx, QueryCtx } from "./_generated/server";
 import { internal } from "./_generated/api";
 import type { Id } from "./_generated/dataModel";
@@ -399,5 +399,64 @@ export const setPinned = mutation({
     const loaded = await loadScanFor(ctx, args.id, args.deviceId);
     if (!loaded || !loaded.isOwner) throw new Error("Not allowed to modify this result.");
     await ctx.db.patch(args.id, { pinned: args.pinned });
+  },
+});
+
+/* ------------------------------------------------------------------ */
+/* REST API helpers — called from HTTP actions, which have no direct   */
+/* database access, so ownership is enforced here instead.             */
+/* ------------------------------------------------------------------ */
+
+export const apiQuotaFor = internalQuery({
+  args: { userId: v.id("users") },
+  handler: async (ctx, args) => {
+    const { limit, plan } = await limitFor(ctx, args.userId);
+    const used = await usedToday(ctx, args.userId, null);
+    return { used, limit, plan };
+  },
+});
+
+export const apiListFor = internalQuery({
+  args: { userId: v.id("users"), limit: v.optional(v.number()) },
+  handler: async (ctx, args) => {
+    const rows = await ctx.db
+      .query("scans")
+      .withIndex("by_user", (q) => q.eq("userId", args.userId))
+      .order("desc")
+      .take(Math.min(args.limit ?? 50, 50));
+    return rows.map((s) => ({
+      id: s._id,
+      type: s.type,
+      fileName: s.fileName,
+      verdict: s.verdict ?? null,
+      confidence: s.confidence ?? null,
+      isPublic: s.isPublic ?? false,
+      createdAt: s.createdAt,
+    }));
+  },
+});
+
+export const apiGetFor = internalQuery({
+  args: { userId: v.id("users"), scanId: v.string() },
+  handler: async (ctx, args) => {
+    const id = ctx.db.normalizeId("scans", args.scanId);
+    if (!id) return { status: "missing" as const };
+    const scan = await ctx.db.get(id);
+    if (!scan) return { status: "missing" as const };
+    if (scan.userId !== args.userId) return { status: "forbidden" as const };
+    return {
+      status: "ok" as const,
+      scan: {
+        id: scan._id,
+        type: scan.type,
+        fileName: scan.fileName,
+        verdict: scan.verdict ?? null,
+        confidence: scan.confidence ?? null,
+        isPublic: scan.isPublic ?? false,
+        createdAt: scan.createdAt,
+        expiresAt: scan.expiresAt,
+        resultJson: scan.resultJson,
+      },
+    };
   },
 });
