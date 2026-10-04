@@ -34,7 +34,7 @@ const PIPELINE = [
   {
     step: "06",
     title: "Decide, honestly",
-    body: "Thresholds separate real from fake; anything between them — or any conflict between strong checks — becomes Inconclusive. Confidence is capped below certainty so the number never reads as proof.",
+    body: "Thresholds separate real from fake — but a check that actively fired can never be averaged away into ‘Real’: any flagged measurement floors the result into Inconclusive, and decisive face evidence floors it at Likely deepfake. When the file itself is washed out (heavy recompression, blur, resampling) ‘no signals found’ proves nothing, so Real is withheld. Confidence is capped below certainty so the number never reads as proof.",
   },
 ];
 
@@ -111,6 +111,7 @@ export default function About() {
               ["Per-face checks", "Edge density, colour statistics and noise inside every detected face box."],
               ["Temporal analysis (video)", "Frame-to-frame flicker, lighting drift and landmark jitter — fakes struggle to stay stable."],
               ["Audio profile (video)", "Clipping, DC offset, silence runs and spectral shape. Honest limits: voice-clone classification is not in v1."],
+              ["Evidence quality gate", "Sharpness and compression level are measured first: a washed-out file can only be Inconclusive, never cleared as Real."],
             ].map(([name, body]) => (
               <div
                 key={name}

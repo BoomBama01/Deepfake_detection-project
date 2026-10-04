@@ -165,6 +165,10 @@ export default function Learn() {
                 a: "It is an arms race. Generators improve, forensic checks adapt. Treat every verdict as one input among several, and re-check important files with fresh tools.",
               },
               {
+                q: "Why did a heavily re-compressed or blurry image come back Inconclusive instead of Real?",
+                a: "Recompression and resampling destroy the very traces detection relies on. In that situation ‘nothing found’ would be a false all-clear, so the tool withholds the Real verdict, explains which evidence was washed out, and caps its confidence — an honest ‘cannot tell’ beats a confident guess.",
+              },
+              {
                 q: "Do you store my video?",
                 a: "Your original file never leaves your device. Only a small downscaled preview and analysis artifacts are stored, and they are purged after 24 hours.",
               },
