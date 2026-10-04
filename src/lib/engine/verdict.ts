@@ -12,13 +12,20 @@
  *     generator signatures embedded in metadata) floors the score at 0.72,
  *     because such evidence does not need statistical corroboration.
  *  3. FLAG VETO — a check that actively fired (status "flag") can never be
- *     averaged away into "Real": the score is floored into the inconclusive
- *     band, and decisive face evidence (worst face measurement ≥ 0.80)
- *     floors at the synthetic threshold, yielding Likely deepfake.
+ *     averaged away into "Real": the score is floored just above the
+ *     decision midpoint (the AI side), and decisive face evidence (worst
+ *     face measurement ≥ 0.80) floors at the synthetic threshold, yielding
+ *     Likely deepfake.
  *  4. EVIDENCE QUALITY — when the file is heavily recompressed (JPEG ≤ 65)
  *     or blurred/resampled (p90 gradient < 95), absence of manipulation
- *     signals proves nothing, so a "Real" verdict is withheld (→
- *     Inconclusive) and confidence is capped at 50%.
+ *     signals proves nothing, so the Real call is capped at 50% confidence
+ *     and marked low-confidence instead of being reported as a firm pass.
+ *  5. BINARY VERDICT — the verdict is always "Real" or an AI-side verdict
+ *     (likely_ai / likely_deepfake); there is no third answer. Scores that
+ *     land between the thresholds are resolved to the side of the midpoint
+ *     and capped at 50% confidence. Uncertainty is carried by the
+ *     confidence number (40–60% uncertain band), never by withholding a
+ *     verdict.
  *
  * Confidence reflects distance from the decision boundary plus agreement
  * between checks, and is capped below 100 — no detector is perfect.
@@ -41,6 +48,7 @@ export const THRESHOLDS: Record<Sensitivity, { real: number; fake: number }> = {
 
 export const VERDICT_LABEL: Record<Verdict, string> = {
   real: "Real — no manipulation signals",
+  /** legacy scans only — the engine no longer produces this verdict */
   inconclusive: "Inconclusive",
   likely_ai: "Likely AI-generated",
   likely_deepfake: "Likely deepfake (manipulated face)",
@@ -127,7 +135,6 @@ export function decideCore(
      measurement that actively fired. */
   const flags = active.filter((c) => c.status === "flag");
   let faceDecisive = false;
-  let blockedReal = false;
   if (flags.length > 0) {
     const faceFlag = flags.find((c) => c.group === "face");
     const decisiveFace = flags.find((c) => c.group === "face" && c.raw >= 0.8);
@@ -142,11 +149,11 @@ export function decideCore(
       score = Math.max(score, floor);
       if (faceFlag) {
         explanation.push(
-          `Flagged face measurement: ${faceFlag.finding} The score is floored into the inconclusive band at ${floor.toFixed(2)} — strong but not decisive face evidence, so the result is reported as Inconclusive rather than guessed.`,
+          `Flagged face measurement: ${faceFlag.finding} The score is floored to ${floor.toFixed(2)} — the AI side of the decision midpoint — so the call becomes AI at low confidence rather than a pass.`,
         );
       } else {
         explanation.push(
-          `Flagged measurement(s): ${flags.map((c) => c.label).join(", ")} — a check that actively fired vetoes a “Real” verdict, so the score is floored into the inconclusive band at ${floor.toFixed(2)}.`,
+          `Flagged measurement(s): ${flags.map((c) => c.label).join(", ")} — a check that actively fired vetoes a “Real” verdict, so the score is floored to the AI side of the midpoint at ${floor.toFixed(2)}.`,
         );
       }
     }
@@ -163,11 +170,18 @@ export function decideCore(
   const coverage = clamp(active.length / 5, 0, 1);
   let confidence = 100 * (0.22 + 0.43 * distance + 0.35 * agreement) * (0.72 + 0.28 * coverage);
 
+  /* binary resolution: every score resolves to Real or an AI-side verdict.
+     Scores past either threshold are firm calls; scores inside the
+     undecided middle resolve to the side of the midpoint and are marked
+     low-confidence (rule 5). */
+  const midpoint = (t.real + t.fake) / 2;
+  const faceHeavy =
+    faceDecisive ||
+    (faceScore !== null && faceScore >= Math.min(t.fake + 0.02, score + 0.05));
+
   let verdict: Verdict;
+  let lowConfidenceCall = false;
   if (score >= t.fake) {
-    const faceHeavy =
-      faceDecisive ||
-      (faceScore !== null && faceScore >= Math.min(t.fake + 0.02, score + 0.05));
     verdict = faceHeavy ? "likely_deepfake" : "likely_ai";
     explanation.push(
       `Combined synthetic-lean score ${score.toFixed(2)} is above the ${label} threshold of ${t.fake.toFixed(2)} for this run.`,
@@ -183,12 +197,12 @@ export function decideCore(
     }
   } else if (score <= t.real) {
     if (input.evidence?.degraded) {
-      verdict = "inconclusive";
-      blockedReal = true;
+      verdict = "real";
+      lowConfidenceCall = true;
       score = Math.max(score, t.real + 0.02);
       explanation.push(
         `Evidence degraded — ${input.evidence.reasons.join("; ")}. ` +
-          "In these conditions ‘no manipulation signals found’ does not mean ‘authentic’, so a Real verdict is withheld and the file is reported Inconclusive.",
+          "In these conditions ‘no manipulation signals found’ does not prove authenticity, so this is reported as a low-confidence Real call: confidence is capped at 50% — treat it as a lean, not a pass.",
       );
     } else {
       verdict = "real";
@@ -197,10 +211,17 @@ export function decideCore(
       );
     }
   } else {
-    verdict = "inconclusive";
+    lowConfidenceCall = true;
+    const side = score >= midpoint;
+    verdict = side ? (faceHeavy ? "likely_deepfake" : "likely_ai") : "real";
     explanation.push(
-      `Combined score ${score.toFixed(2)} falls between the authentic (${t.real.toFixed(2)}) and synthetic (${t.fake.toFixed(2)}) thresholds — the evidence does not clearly point either way.`,
+      `Combined score ${score.toFixed(2)} falls between the authentic (${t.real.toFixed(2)}) and synthetic (${t.fake.toFixed(2)}) thresholds — it sits ${side ? "on the AI side" : "on the authentic side"} of the decision midpoint (${midpoint.toFixed(2)}), so the call is ${side ? "AI" : "Real"}, reported at low confidence (capped at 50%).`,
     );
+    if (verdict === "likely_deepfake") {
+      explanation.push(
+        `Face-region measurements (mean ${(faceScore ?? 0).toFixed(2)}) are the strongest signal, so the manipulation is concentrated in the face — the pattern of a face swap or face reenactment.`,
+      );
+    }
   }
 
   /* top contributing checks, quoted with their measured values */
@@ -217,18 +238,18 @@ export function decideCore(
   );
 
   confidence = clamp(confidence, 10, 97);
-  if (blockedReal) confidence = Math.min(confidence, 50);
+  if (lowConfidenceCall) confidence = Math.min(confidence, 50);
   const rounded = Math.round(confidence * 10) / 10;
   const uncertainBand =
     rounded >= UNCERTAIN_BAND.lo && rounded <= UNCERTAIN_BAND.hi;
   if (uncertainBand) {
     explanation.push(
-      `Confidence ${rounded}% sits inside the ${UNCERTAIN_BAND.lo}–${UNCERTAIN_BAND.hi}% uncertain band: the label above is provisional, not a firm call.`,
+      `Confidence ${rounded}% sits inside the ${UNCERTAIN_BAND.lo}–${UNCERTAIN_BAND.hi}% uncertain band: the verdict above is a low-confidence lean, not a firm call.`,
     );
-  } else if (verdict === "inconclusive") {
+  }
+  if (lowConfidenceCall && !uncertainBand) {
     explanation.push(
-      "Inconclusive means the evidence genuinely does not decide — treat this as " +
-        "‘not established either way’, never as a pass for the file.",
+      `Confidence ${rounded}% is low: the verdict above is a lean forced by borderline or degraded evidence, not a firm call.`,
     );
   }
   return {

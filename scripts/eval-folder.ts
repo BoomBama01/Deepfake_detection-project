@@ -15,9 +15,13 @@
  *             automatically).
  * --sensitivity  low | balanced | high (default balanced)
  *
- * "Inconclusive" is an abstention, not a guess: it is reported separately
- * and counts against strict accuracy, while precision/recall are computed
- * over called results with abstained fakes counted as missed detections.
+ * The engine is binary: every analysed file comes back "real" or an
+ * AI-side verdict (likely_ai / likely_deepfake) — there is no third
+ * verdict. The abstain column therefore only catches files that failed to
+ * analyse; they count against strict accuracy, while precision/recall are
+ * computed over called results with abstained fakes counted as missed
+ * detections. Calls made with confidence ≤ 60% (the uncertain band) are
+ * reported separately so binary output never hides weak evidence.
  */
 import { readdirSync, readFileSync, statSync } from "fs";
 import { join, relative } from "path";
@@ -150,7 +154,7 @@ const recall = actualFake.length > 0 ? tp / actualFake.length : 0;
 const f1 = precision + recall > 0 ? (2 * precision * recall) / (precision + recall) : 0;
 const strictAcc = (tp + tn) / (total || 1);
 
-console.log(`\nConfusion matrix (fake = positive; abstain = Inconclusive/Error):`);
+console.log(`\nConfusion matrix (fake = positive; abstain = analysis error):`);
 console.log(`                    predicted real   predicted fake   abstain`);
 console.log(`  actual real        ${String(tn).padStart(8)}         ${String(fp).padStart(8)}          ${String(abstainReal).padStart(8)}`);
 console.log(`  actual fake        ${String(fn).padStart(8)}         ${String(tp).padStart(8)}          ${String(abstainFake).padStart(8)}`);
@@ -160,6 +164,10 @@ console.log(`  Coverage (decided / total)           : ${pct(decided, total)}`);
 console.log(`  Precision (of called fake)           : ${pct(tp, tp + fp)}`);
 console.log(`  Recall (of all real fakes)           : ${pct(tp, actualFake.length)}  [abstained fakes count as missed]`);
 console.log(`  F1                                    : ${f1.toFixed(3)}`);
+const lowConfCalls = rows.filter((r) => r.pred !== "abstain" && r.confidence <= 60).length;
+console.log(
+  `  Low-confidence calls (≤ 60%)         : ${lowConfCalls} / ${decided} decided  [binary verdict, weak evidence]`,
+);
 if (skipped) console.log(`  Skipped/failed files                 : ${skipped}`);
 if (total < 30) {
   console.log(`\n  ⚠ n=${total} is far too small for a meaningful estimate — this run is a`);

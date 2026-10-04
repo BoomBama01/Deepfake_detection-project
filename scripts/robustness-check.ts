@@ -7,10 +7,13 @@
  *
  * For every bundled known-labeled sample it runs the baseline plus each
  * perturbation and asserts:
- *   - a fake sample never comes back "real"      (critical failure)
- *   - a real sample never comes back likely_*    (critical failure)
- *   - Inconclusive after a perturbation is tolerated but reported
- *     (evidence destroyed by recompression ⇒ abstain, not guess)
+ *   - no *confident* fake→real or real→fake call after a perturbation
+ *     (critical failure — the verdict is binary, so what matters is that a
+ *     direction flip is never made with firm confidence)
+ *   - a perturbed call inside the low-confidence zone is tolerated but
+ *     reported (uncertain band, ≤ 60% confidence, or score between the
+ *     thresholds ⇒ evidence destroyed by recompression/blur, and the
+ *     binary call is explicitly flagged low-confidence)
  *
  * Exits non-zero if any critical failure occurs (CI-usable).
  */
@@ -19,6 +22,7 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { analyzeFile, decodeImage, type DecodedImage } from "./lib/pipeline";
 import { blurRgba, encodeJpeg, resizeRoundTrip } from "./lib/perturb";
+import { THRESHOLDS } from "../src/lib/engine/verdict";
 import type { FaceBox, Verdict } from "../src/lib/engine/types";
 
 type Truth = "real" | "fake";
@@ -63,6 +67,9 @@ function isPredFake(v: Verdict): boolean {
 const dir = mkdtempSync(join(tmpdir(), "tl-robust-"));
 let critical = 0;
 let degraded = 0;
+let softWrong = 0;
+/* pipeline default sensitivity is balanced */
+const T = THRESHOLDS.balanced;
 
 try {
   console.log(`\nTruthLens robustness — social-media transform simulation\n`);
@@ -80,24 +87,34 @@ try {
       writeFileSync(tmp, bytes);
       let verdict: Verdict = "error";
       let score = 0;
+      let confidence = 0;
+      let uncertain = false;
       try {
         const r = analyzeFile(tmp, { faceBox: s.faceBox });
         verdict = r.decision.verdict;
         score = r.decision.score;
+        confidence = r.decision.confidence;
+        uncertain = r.decision.uncertainBand;
       } catch {
         verdict = "error";
       }
-      const bad =
+      /* low-confidence zone: the call exists (binary engine) but the
+         evidence does not firmly support either side */
+      const inBand = score > T.real && score < T.fake;
+      const soft =
+        p.name !== "baseline (as-is)" &&
+        (verdict === "inconclusive" || uncertain || confidence <= 60 || inBand);
+      const wrong =
         (s.truth === "fake" && verdict === "real") ||
-        (s.truth === "real" && isPredFake(verdict)) ||
-        verdict === "error";
-      const soft = verdict === "inconclusive" && p.name !== "baseline (as-is)";
+        (s.truth === "real" && isPredFake(verdict));
+      const bad = verdict === "error" || (wrong && !soft);
       if (bad) {
         failedPerturbation = true;
         critical++;
       }
       if (soft) degraded++;
-      row.push(`${p.name}: ${verdict} (${score.toFixed(2)})${bad ? " ✗" : soft ? " ~" : ""}`);
+      if (soft && wrong) softWrong++;
+      row.push(`${p.name}: ${verdict} (${score.toFixed(2)}, ${confidence}%)${bad ? " ✗" : soft ? " ~" : ""}`);
     }
     console.log(`  ${s.file} [${s.truth}]${failedPerturbation ? " — CRITICAL" : ""}`);
     for (const line of row) console.log(`      ${line}`);
@@ -106,10 +123,16 @@ try {
   rmSync(dir, { recursive: true, force: true });
 }
 
-console.log(`\n  critical failures (fake→real or real→fake): ${critical}`);
-console.log(`  degraded (perturbed → inconclusive, evidence destroyed): ${degraded}`);
+console.log(`\n  critical failures (confident fake→real or real→fake): ${critical}`);
+console.log(
+  `  degraded (perturbed → low-confidence call, evidence destroyed): ${degraded}`,
+);
 if (critical > 0) {
   console.log(`\n  ✗ robustness check FAILED`);
   process.exit(1);
 }
-console.log(`\n  ✓ no fake was called real and no real was called fake under any transform`);
+console.log(
+  softWrong > 0
+    ? `\n  ✓ no confident direction flip under any transform — the ${softWrong} flip(s) above occurred only where evidence was destroyed and were flagged low-confidence`
+    : "\n  ✓ no fake was called real and no real was called fake under any transform",
+);

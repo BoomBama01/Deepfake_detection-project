@@ -140,7 +140,7 @@ export default function Learn() {
                 <li>· Defeat a determined adversary who knows the checks</li>
                 <li>· Replace human judgement or source verification</li>
                 <li>· Guarantee anything: no detector is 100% accurate</li>
-                <li>· Work on every file — some results are inconclusive</li>
+                <li>· Be equally sure about every file — borderline results come back low-confidence</li>
               </ul>
             </div>
           </div>
@@ -153,20 +153,20 @@ export default function Learn() {
           <div className="space-y-3">
             {[
               {
-                q: "Why does my selfie come back inconclusive?",
-                a: "Heavy phone processing (beauty modes, HDR stacking, recompression) blurs the line between captured and generated. When evidence conflicts, TruthLens says so instead of guessing.",
+                q: "Why is my selfie only around 50% confident?",
+                a: "Heavy phone processing (beauty modes, HDR stacking, recompression) blurs the line between captured and generated. TruthLens still gives you a binary Real or AI call, but honestly caps its confidence when the evidence is borderline instead of inflating the number.",
               },
               {
                 q: "A screenshot lost all its metadata — is it fake?",
-                a: "No. Screenshots legitimately strip EXIF. Missing provenance makes the metadata check inconclusive, not the image suspicious; the pixel-level checks still run.",
+                a: "No. Screenshots legitimately strip EXIF. Missing provenance leaves the metadata check unresolved, not the image suspicious; the pixel-level checks still run.",
               },
               {
                 q: "Can deepfake detectors keep up?",
                 a: "It is an arms race. Generators improve, forensic checks adapt. Treat every verdict as one input among several, and re-check important files with fresh tools.",
               },
               {
-                q: "Why did a heavily re-compressed or blurry image come back Inconclusive instead of Real?",
-                a: "Recompression and resampling destroy the very traces detection relies on. In that situation ‘nothing found’ would be a false all-clear, so the tool withholds the Real verdict, explains which evidence was washed out, and caps its confidence — an honest ‘cannot tell’ beats a confident guess.",
+                q: "Why does a heavily re-compressed or blurry image come back with low confidence?",
+                a: "Recompression and resampling destroy the very traces detection relies on. In that situation ‘nothing found’ would be a false all-clear, so the verdict still leans to the side of its measurement — Real or AI — but its confidence is capped at 50% and flagged as low-confidence, with the explanation naming exactly which evidence was washed out.",
               },
               {
                 q: "Do you store my video?",

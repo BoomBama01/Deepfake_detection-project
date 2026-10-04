@@ -93,6 +93,9 @@ type ScanRow = {
   fileName: string;
   verdict: "real" | "inconclusive" | "likely_ai" | "likely_deepfake" | "error" | null;
   confidence: number | null;
+  /** stored combined score (legacy rows only — used to place old
+      "inconclusive" rows on their binary side) */
+  score: number | null;
   isPublic: boolean;
   pinned: boolean;
   createdAt: number;
@@ -104,10 +107,9 @@ const VERDICT_META: Record<
   string,
   { label: string; short: string; color: string }
 > = {
-  real: { label: "Real", short: "Real", color: "var(--verdict-real)" },
-  inconclusive: {
-    label: "Inconclusive",
-    short: "Inconc.",
+  real: { label: "Real", short: "Real", color: "var(--verdict-real)" },  inconclusive: {
+    label: "Low confidence",
+    short: "Low conf.",
     color: "var(--verdict-uncertain)",
   },
   likely_ai: {
@@ -128,6 +130,22 @@ const VERDICT_META: Record<
 };
 
 const PLAN_LIMITS: Record<string, number> = { free: 25, pro: 500, team: 2000 };
+
+/**
+ * Binary display verdict: the engine only ever returns Real or an AI-side
+ * verdict for new scans. Legacy rows may hold "inconclusive"/null from the
+ * old three-way engine — resolve those to the side of their stored score so
+ * the table always reads Real or AI ("Low confidence" only when no score
+ * was stored either).
+ */
+function displayVerdict(
+  verdict: ScanRow["verdict"],
+  score: number | null,
+): "real" | "inconclusive" | "likely_ai" | "likely_deepfake" | "error" {
+  if (verdict != null && verdict !== "inconclusive") return verdict;
+  if (score != null) return score >= 0.5 ? "likely_ai" : "real";
+  return "inconclusive";
+}
 
 function StatCard({
   label,
@@ -210,7 +228,7 @@ export default function Dashboard() {
     const q = search.trim().toLowerCase();
     let list = rows.filter((r) => {
       if (q && !r.fileName.toLowerCase().includes(q)) return false;
-      if (verdictFilter !== "all" && (r.verdict ?? "inconclusive") !== verdictFilter)
+      if (verdictFilter !== "all" && displayVerdict(r.verdict, r.score) !== verdictFilter)
         return false;
       if (typeFilter !== "all" && r.type !== typeFilter) return false;
       return true;
@@ -239,7 +257,8 @@ export default function Dashboard() {
 
   /* ---- overview stats ---- */
   const stats = useMemo(() => {
-    const count = (v: string) => rows.filter((r) => (r.verdict ?? "") === v).length;
+    const count = (v: string) =>
+      rows.filter((r) => displayVerdict(r.verdict, r.score) === v).length;
     const flagged = count("likely_ai") + count("likely_deepfake");
     const real = count("real");
     const withConf = rows.filter((r) => r.confidence != null);
@@ -281,7 +300,7 @@ export default function Dashboard() {
     return order
       .map((v) => ({
         name: VERDICT_META[v].short,
-        value: rows.filter((r) => (r.verdict ?? "inconclusive") === v).length,
+        value: rows.filter((r) => displayVerdict(r.verdict, r.score) === v).length,
         color: VERDICT_META[v].color,
       }))
       .filter((d) => d.value > 0);
@@ -719,7 +738,7 @@ export default function Dashboard() {
                 <SelectContent>
                   <SelectItem value="all">All verdicts</SelectItem>
                   <SelectItem value="real">Real</SelectItem>
-                  <SelectItem value="inconclusive">Inconclusive</SelectItem>
+                  <SelectItem value="inconclusive">Low confidence</SelectItem>
                   <SelectItem value="likely_ai">Likely AI</SelectItem>
                   <SelectItem value="likely_deepfake">Likely deepfake</SelectItem>
                   <SelectItem value="error">Failed</SelectItem>
@@ -897,7 +916,7 @@ export default function Dashboard() {
                               </span>
                             </TableCell>
                             <TableCell>
-                              <VerdictBadge verdict={row.verdict ?? "inconclusive"} />
+                              <VerdictBadge verdict={displayVerdict(row.verdict, row.score)} />
                             </TableCell>
                             <TableCell className="text-right font-mono tabular-nums">
                               {row.confidence != null

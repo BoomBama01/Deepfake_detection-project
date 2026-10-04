@@ -3,7 +3,8 @@ import type { Verdict } from "@/lib/engine/types";
 
 const SHORT: Record<Verdict, string> = {
   real: "Real",
-  inconclusive: "Inconclusive",
+  /** legacy no-score rows only — the engine never produces this verdict */
+  inconclusive: "Low confidence",
   likely_ai: "Likely AI-generated",
   likely_deepfake: "Likely deepfake",
   error: "Analysis failed",

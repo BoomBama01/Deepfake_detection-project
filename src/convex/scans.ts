@@ -304,19 +304,33 @@ export const listMine = query({
       .withIndex("by_user", (q) => q.eq("userId", userId))
       .order("desc")
       .take(Math.min(args.limit ?? 200, 500));
-    return rows.map((s) => ({
-      _id: s._id,
-      type: s.type,
-      source: s.source,
-      fileName: s.fileName,
-      verdict: s.verdict,
-      confidence: s.confidence,
-      isPublic: s.isPublic ?? false,
-      pinned: s.pinned ?? false,
-      createdAt: s.createdAt,
-      expiresAt: s.expiresAt,
-      fileSize: s.fileSize,
-    }));
+    return rows.map((s) => {
+      /* Legacy rows only: the old three-way engine stored "inconclusive".
+         The product is binary now, so the table needs the stored score to
+         display those rows on the side of their own measurement. */
+      let score: number | null = null;
+      if ((s.verdict === "inconclusive" || !s.verdict) && s.resultJson) {
+        try {
+          score = (JSON.parse(s.resultJson) as { score?: number }).score ?? null;
+        } catch {
+          score = null;
+        }
+      }
+      return {
+        _id: s._id,
+        type: s.type,
+        source: s.source,
+        fileName: s.fileName,
+        verdict: s.verdict,
+        confidence: s.confidence,
+        score,
+        isPublic: s.isPublic ?? false,
+        pinned: s.pinned ?? false,
+        createdAt: s.createdAt,
+        expiresAt: s.expiresAt,
+        fileSize: s.fileSize,
+      };
+    });
   },
 });
 

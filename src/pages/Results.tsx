@@ -209,7 +209,15 @@ export default function Results() {
     }
   };
 
-  const verdict = scan.verdict ?? "inconclusive";
+  const storedVerdict = scan.verdict ?? "inconclusive";
+  /* legacy rows may hold "inconclusive" from the old three-way engine —
+     the product is binary now, so display them on the side of their score */
+  const verdict =
+    storedVerdict === "inconclusive"
+      ? analysis.score >= 0.5
+        ? ("likely_ai" as const)
+        : ("real" as const)
+      : storedVerdict;
   const title = isVideo ? "Video examination" : "Image examination";
 
   return (
@@ -236,13 +244,13 @@ export default function Results() {
             <div>
               <div className="flex flex-wrap items-center gap-4">
                 <VerdictBadge verdict={verdict} large />
-                {(analysis.confidence >= 40 && analysis.confidence <= 60) ||
-                verdict === "inconclusive" ? (
+                {(analysis.confidence <= 60 || storedVerdict === "inconclusive") &&
+                verdict !== "error" ? (
                   <span
                     role="status"
                     className="rounded border border-[var(--verdict-uncertain)]/60 bg-[var(--verdict-uncertain)]/10 px-2 py-1 font-mono text-[10px] uppercase tracking-[0.18em] text-[var(--verdict-uncertain)]"
                   >
-                    Uncertain — inside the 40–60% band
+                    Low confidence — a lean, not a firm call
                   </span>
                 ) : null}
                 <div className="font-mono text-xs text-muted-foreground">
@@ -647,20 +655,24 @@ export default function Results() {
                   evidence)
                 </li>
                 <li>
-                  any flagged check vetoes Real — score floors into the inconclusive band; the
-                  worst face measurement ≥ 0.80 floors at the synthetic threshold (likely
-                  deepfake)
+                  every score resolves to a binary verdict — Real or AI-side; scores between the
+                  thresholds go to the side of the midpoint and are capped at 50% confidence
                 </li>
                 <li>
-                  degraded evidence (JPEG quality ≤ 65 or p90 gradient &lt; 95) withholds Real and
-                  caps confidence at 50%
+                  any flagged check vetoes Real — score floors onto the AI side of the decision
+                  midpoint; the worst face measurement ≥ 0.80 floors at the synthetic threshold
+                  (likely deepfake)
+                </li>
+                <li>
+                  degraded evidence (JPEG quality ≤ 65 or p90 gradient &lt; 95) keeps its Real call
+                  but caps confidence at 50% and marks it low-confidence
                 </li>
                 <li>
                   face-dominant images up-weight face checks and scale whole-frame checks ×0.4
                 </li>
                 <li>
                   confidence = boundary distance × check agreement × coverage, capped at 97% (50%
-                  when evidence is degraded)
+                  for borderline or degraded calls; 40–60% is drawn as the uncertain band)
                 </li>
               </ul>
               <div className="mt-4 overflow-x-auto">

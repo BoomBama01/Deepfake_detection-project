@@ -103,8 +103,9 @@ const ELA_Q = 0.9;
  * social-media transforms (scripts/measure-bands.ts):
  *   natural photos p90-grad 102–182 · blurred 33–90 · down/up-scaled 41–135
  *   platform recompression sits at QF 75–90; ≤ 65 is aggressive re-encoding.
- * Soft-but-authentic images therefore come back Inconclusive, not Real —
- * an abstention, never a false accusation.
+ * Soft-but-authentic images therefore never come back as a *confident*
+ * Real — the call stays on the measured side but is capped at 50%
+ * confidence and flagged low-confidence: a hedge, never a false accusation.
  */
 export const EVIDENCE = {
   /** JPEG quality at/below which quantization destroys HF forensics */
@@ -851,7 +852,7 @@ export function analyzeFace(
           score: 0.5,
           weight: 0,
           status: "skip",
-          finding: "Face region too small for reliable forensic measurements; this face is reported as inconclusive.",
+          finding: "Face region too small for reliable forensic measurements; this face is skipped and does not vote.",
         }),
       ],
     };

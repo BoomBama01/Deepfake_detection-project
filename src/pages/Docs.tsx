@@ -215,7 +215,9 @@ export default function Docs() {
                 <tr>
                   <td className="px-4 py-2 font-mono text-xs">inconclusive</td>
                   <td className="px-4 py-2 text-muted-foreground">
-                    Evidence conflicts or is too weak. Not a pass, not a fail.
+                    Legacy records only (old three-way engine). New analyses
+                    are always binary — real, likely_ai or likely_deepfake —
+                    and express uncertainty as low confidence instead.
                   </td>
                 </tr>
                 <tr>
