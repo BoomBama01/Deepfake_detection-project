@@ -10,7 +10,6 @@
 import {
   analyzeFace,
   analyzeSignal,
-  combineChecks,
   ENGINE_INFO,
   WEIGHTS,
 } from "./forensics";
@@ -276,17 +275,31 @@ export async function runImage(
             ? "Some face-level measurements are elevated but not conclusive."
             : "Face-level measurements sit inside expected ranges."),
     });
+
+    /* When faces dominate the frame, the whole-image checks are measuring the
+       same pixels — down-weight them so the face evidence isn't outvoted by
+       corroboration of itself. */
+    const faceAreaRatio = Math.min(
+      1,
+      faces.reduce((a, f) => a + f.box.w * f.box.h, 0),
+    );
+    if (faceAreaRatio > 0.35) {
+      for (const c of checks) {
+        if (c.id === "face") c.weight = 0.6;
+        else if (c.group === "signal" || c.group === "spectral" || c.id === "ela")
+          c.weight *= 0.4;
+      }
+    }
   }
 
-  const score = combineChecks(checks);
   emit({ stage: "report", pct: 86, note: "Composing verdict" });
   const decision = decideVerdict({
-    score,
     checks,
     faceScore,
     kind: "image",
     sensitivity: settings.sensitivity,
   });
+  const score = decision.score;
 
   const analysis: ImageAnalysis = {
     kind: "image",
@@ -736,14 +749,13 @@ export async function runVideo(
   }
   checks.push(...audioChecks);
 
-  const finalScore = combineChecks(checks);
   const decision = decideVerdict({
-    score: finalScore,
     checks,
     faceScore,
     kind: "video",
     sensitivity: settings.sensitivity,
   });
+  const finalScore = decision.score;
 
   const analysis: VideoAnalysis = {
     kind: "video",

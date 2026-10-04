@@ -12,7 +12,15 @@ import "./index.css";
 // Lazy load route components for better code splitting
 const Landing = lazy(() => import("./pages/Landing.tsx"));
 const AuthPage = lazy(() => import("./pages/Auth.tsx"));
+const Analyze = lazy(() => import("./pages/Analyze.tsx"));
+const Results = lazy(() => import("./pages/Results.tsx"));
 const Dashboard = lazy(() => import("./pages/Dashboard.tsx"));
+const Docs = lazy(() => import("./pages/Docs.tsx"));
+const Learn = lazy(() => import("./pages/Learn.tsx"));
+const About = lazy(() => import("./pages/About.tsx"));
+const Privacy = lazy(() => import("./pages/Privacy.tsx"));
+const Terms = lazy(() => import("./pages/Terms.tsx"));
+const Contact = lazy(() => import("./pages/Contact.tsx"));
 const NotFound = lazy(() => import("./pages/NotFound.tsx"));
 
 // Simple loading fallback for route transitions
@@ -124,6 +132,14 @@ createRoot(document.getElementById("root")!).render(
                 path="/auth"
                 element={<AuthPage redirectAfterAuth="/dashboard" />}
               />
+              <Route path="/analyze" element={<Analyze />} />
+              <Route path="/results/:id" element={<Results />} />
+              <Route path="/docs" element={<Docs />} />
+              <Route path="/learn" element={<Learn />} />
+              <Route path="/about" element={<About />} />
+              <Route path="/privacy" element={<Privacy />} />
+              <Route path="/terms" element={<Terms />} />
+              <Route path="/contact" element={<Contact />} />
               <Route
                 path="/dashboard"
                 element={

@@ -2,13 +2,26 @@
  * TruthLens engine — verdict decision.
  *
  * Deterministic: thresholds depend only on the sensitivity setting and the
- * measured combined score. Confidence reflects how far the score sits from the
- * decision boundary plus how much the individual checks agree — it is capped
- * below 100 because no detector is perfect.
+ * measured checks. Two documented rules shape the combined score:
+ *
+ *  1. WEAK-AUTHENTICITY FLOOR — a check that simply *passes* only rules
+ *     fakery out weakly (a measurement inside the natural range can also be
+ *     forged to look natural). Passing checks contribute a mild authentic
+ *     lean (0.30) instead of strong certainty.
+ *  2. STRUCTURAL EVIDENCE — a direct, high-confidence signal (known
+ *     generator signatures embedded in metadata) floors the score at 0.72,
+ *     because such evidence does not need statistical corroboration.
+ *
+ * Confidence reflects distance from the decision boundary plus agreement
+ * between checks, and is capped below 100 — no detector is perfect.
  */
 
-import { clamp, mean, stdDev } from "./dsp";
+import { clamp } from "./dsp";
+import { combineChecks } from "./forensics";
 import type { Check, Sensitivity, Verdict } from "./types";
+
+export const OK_SCORE_FLOOR = 0.3;
+export const STRUCTURAL_FLOOR = 0.72;
 
 export const THRESHOLDS: Record<Sensitivity, { real: number; fake: number }> = {
   low: { real: 0.3, fake: 0.75 },
@@ -25,7 +38,6 @@ export const VERDICT_LABEL: Record<Verdict, string> = {
 };
 
 export interface VerdictInput {
-  score: number;
   checks: Check[];
   /** mean face score when faces were analysed; null otherwise */
   faceScore: number | null;
@@ -36,11 +48,13 @@ export interface VerdictInput {
 export interface VerdictDecision {
   verdict: Verdict;
   confidence: number;
+  /** combined score after floor/override rules — the number shown in the UI */
+  score: number;
   explanation: string[];
 }
 
 export function decideVerdict(input: VerdictInput): VerdictDecision {
-  const { score, checks, faceScore, kind, sensitivity } = input;
+  const { checks, faceScore, kind, sensitivity } = input;
   const t = THRESHOLDS[sensitivity];
   const active = checks.filter((c) => c.weight > 0 && c.status !== "skip");
 
@@ -50,16 +64,36 @@ export function decideVerdict(input: VerdictInput): VerdictDecision {
     return {
       verdict: "error",
       confidence: 0,
+      score: 0.5,
       explanation: [
         "Too few checks completed to produce a verdict. The file may have failed to decode, or the enabled checks were skipped. No result is guessed — run the analysis again or try another file.",
       ],
     };
   }
 
+  /* rule 1: passing checks lean authentic only weakly */
+  const floored = active.map((c) =>
+    c.status === "ok" ? { ...c, score: Math.max(c.score, OK_SCORE_FLOOR) } : c,
+  );
+  let score = combineChecks(floored);
+
+  /* rule 2: direct structural evidence */
+  const structural = active.find(
+    (c) => c.group === "metadata" && c.status === "flag" && c.score >= 0.9,
+  );
+  if (structural) {
+    score = Math.max(score, STRUCTURAL_FLOOR);
+    explanation.push(
+      `Direct evidence: ${structural.finding} Direct generator signatures override the statistical checks.`,
+    );
+  }
+
   /* confidence: distance from the boundary × agreement between checks */
-  const wsum = active.reduce((a, c) => a + c.weight, 0) || 1;
-  const mu = active.reduce((a, c) => a + c.score * c.weight, 0) / wsum;
-  const disp = Math.sqrt(active.reduce((a, c) => a + c.weight * (c.score - mu) ** 2, 0) / wsum);
+  const wsum = floored.reduce((a, c) => a + c.weight, 0) || 1;
+  const mu = floored.reduce((a, c) => a + c.score * c.weight, 0) / wsum;
+  const disp = Math.sqrt(
+    floored.reduce((a, c) => a + c.weight * (c.score - mu) ** 2, 0) / wsum,
+  );
   const agreement = clamp(1 - 2 * disp, 0, 1);
   const distance = clamp(Math.abs(score - 0.5) * 2, 0, 1);
   const coverage = clamp(active.length / 5, 0, 1);
@@ -84,7 +118,7 @@ export function decideVerdict(input: VerdictInput): VerdictDecision {
   } else if (score <= t.real) {
     verdict = "real";
     explanation.push(
-      `Combined synthetic-lean score ${score.toFixed(2)} is below the ${sensitivity} threshold of ${t.real.toFixed(2)}; every active check sits within ranges expected from camera-sourced media.`,
+      `Combined synthetic-lean score ${score.toFixed(2)} is below the ${sensitivity} threshold of ${t.real.toFixed(2)}; active checks sit within ranges expected from camera-sourced media.`,
     );
   } else {
     verdict = "inconclusive";
@@ -94,10 +128,11 @@ export function decideVerdict(input: VerdictInput): VerdictDecision {
   }
 
   /* top contributing checks, quoted with their measured values */
-  const ranked = [...active]
+  const ranked = [...floored]
     .sort((a, b) => Math.abs(b.weight * (b.score - 0.5)) - Math.abs(a.weight * (a.score - 0.5)))
     .slice(0, 3);
   for (const c of ranked) {
+    if (structural && c.id === structural.id) continue;
     explanation.push(`${c.label}: ${c.finding}`);
   }
 
@@ -106,14 +141,5 @@ export function decideVerdict(input: VerdictInput): VerdictDecision {
   );
 
   confidence = clamp(confidence, 10, 97);
-  return { verdict, confidence: Math.round(confidence * 10) / 10, explanation };
-}
-
-/** Mean of check scores, used for quick aggregates (video frames etc.). */
-export function averageScore(scores: number[]): number {
-  return scores.length ? mean(scores) : 0.5;
-}
-
-export function dispersion(scores: number[]): number {
-  return scores.length ? stdDev(scores) : 0;
+  return { verdict, confidence: Math.round(confidence * 10) / 10, score, explanation };
 }

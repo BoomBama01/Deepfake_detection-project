@@ -312,6 +312,7 @@ export const listMine = query({
       verdict: s.verdict,
       confidence: s.confidence,
       isPublic: s.isPublic ?? false,
+      pinned: s.pinned ?? false,
       createdAt: s.createdAt,
       expiresAt: s.expiresAt,
       fileSize: s.fileSize,
@@ -333,7 +334,12 @@ export const byHash = query({
         (userId && s.userId === userId) || (device && s.deviceId === device),
     );
     if (!match) return null;
-    return { id: match._id, verdict: match.verdict, createdAt: match.createdAt };
+    return {
+      id: match._id,
+      verdict: match.verdict,
+      settings: match.settings,
+      createdAt: match.createdAt,
+    };
   },
 });
 

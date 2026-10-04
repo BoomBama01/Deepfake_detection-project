@@ -37,21 +37,28 @@ export const WEIGHTS = {
   metadata: 0.16,
   grid: 0.1,
   histogram: 0.1,
+  seam: 0.1,
   face: 0.26,
 } as const;
 
 /** Calibration bands. Documented as heuristics in the Technical tab. */
 export const BANDS = {
   /** flat-region residual σ below this ⇒ unnaturally smooth */
-  noiseSmooth: { lo: 0.2, hi: 1.6 },
-  /** coefficient of variation of σ across flat tiles ⇒ local edits */
-  noiseSpread: { lo: 0.55, hi: 1.3 },
+  noiseSmooth: { lo: 0.15, hi: 0.55 },
+  /** very low σ uniformity across flat tiles ⇒ synthetic noise field */
+  noiseUniform: { lo: 0.13, hi: 0.05 },
+  /** very high uniformity variation ⇒ local edits / compositing */
+  noiseSpread: { lo: 0.6, hi: 1.2 },
+  /** max adjacent band-to-band noise jump ⇒ splice seam */
+  noiseJump: { lo: 0.5, hi: 1.2 },
+  /** fraction of rows showing a strong edge at one column ⇒ vertical seam */
+  seamCoherence: { lo: 0.45, hi: 0.75 },
   /** radially-averaged power slope (-β) — natural images sit around 2.0–3.6 */
   spectralSlope: { steep: 3.5, shallow: 2.1 },
   /** upsampling/checkerboard peak prominence over local average */
   spectralPeak: { lo: 2.2, hi: 4.2 },
-  /** p95/mean of ELA energy — localized anomalies stand out */
-  elaLocalized: { lo: 3.0, hi: 9.0 },
+  /** p90/median of per-tile ELA energy — localized anomalies stand out */
+  elaLocalized: { lo: 1.6, hi: 3.5 },
   /** mean ELA energy — near-zero means the re-encode barely changed anything */
   elaSmooth: { lo: 0.5, hi: 1.4 },
   /** 8px JPEG block-grid phase consistency across image bands */
@@ -61,7 +68,8 @@ export const BANDS = {
   histGaps: { lo: 3, hi: 10 },
   histRun: { lo: 5, hi: 25 },
   histClip: { lo: 0.05, hi: 0.2 },
-  faceNoiseRatio: { lo: 0.45, hi: 0.9 },
+  faceNoiseRatio: { lo: 0.95, hi: 0.55 },
+  faceElaDeficit: { lo: 0.85, hi: 0.3 },
   faceRing: { lo: 0.6, hi: 2.0 },
 } as const;
 
@@ -77,7 +85,7 @@ export interface SignalAnalysis {
   ela: Float32Array | null;
   residual: Float32Array;
   tiles: ReturnType<typeof tileStats>;
-  noise: { sigmaFlat: number; flatCv: number; coverage: number };
+  noise: { sigmaFlat: number; flatCv: number; coverage: number; jump: number };
   spectrum: { slope: number; hfRatio: number; peak: number };
   grid: { phase: number; strength: number } | null;
   histogram: { gaps: number; longestRun: number; clipHigh: number; clipLow: number };
@@ -85,6 +93,13 @@ export interface SignalAnalysis {
 }
 
 const ELA_Q = 0.9;
+
+function qualityFrom(metadata: MetadataFindings | null): number | null {
+  const raw = metadata?.tags["EstimatedJpegQuality"];
+  if (!raw) return null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : null;
+}
 
 function check(partial: Omit<Check, "score" | "weight" | "status"> & Partial<Check>): Check {
   return {
@@ -99,7 +114,7 @@ function check(partial: Omit<Check, "score" | "weight" | "status"> & Partial<Che
 
 function noiseCheck(g: Gray, tiles: ReturnType<typeof tileStats>): {
   check: Check;
-  stats: { sigmaFlat: number; flatCv: number; coverage: number };
+  stats: { sigmaFlat: number; flatCv: number; coverage: number; jump: number };
 } {
   const flatThresh = 8;
   const flatIdx: number[] = [];
@@ -114,21 +129,53 @@ function noiseCheck(g: Gray, tiles: ReturnType<typeof tileStats>): {
   if (flatIdx.length < 4) sigmaFlat = percentile(tiles.sigma, 25);
   const flatCv = sigmas.length > 2 ? stdDev(sigmas) / (mean(sigmas) + 1e-6) : 0;
 
+  /* band-to-band noise-field discontinuity: a splice boundary shows up as a
+     step between neighbouring vertical bands even when global CV is low. */
+  const bandCount = Math.min(8, Math.max(2, tiles.cols));
+  const bandW = tiles.cols / bandCount;
+  const bandSigma: number[] = [];
+  for (let b = 0; b < bandCount; b++) {
+    const vals: number[] = [];
+    for (let ty = 0; ty < tiles.rows; ty++) {
+      for (let tx = Math.floor(b * bandW); tx < Math.floor((b + 1) * bandW); tx++) {
+        const idx = ty * tiles.cols + tx;
+        if (tiles.grad[idx] < flatThresh * 2) vals.push(tiles.sigma[idx]);
+      }
+    }
+    if (vals.length >= 2) bandSigma.push(median(vals));
+  }
+  let jump = 0;
+  if (bandSigma.length >= 2) {
+    for (let i = 1; i < bandSigma.length; i++) {
+      jump = Math.max(jump, Math.abs(bandSigma[i] - bandSigma[i - 1]) / (sigmaFlat + 1e-6));
+    }
+  }
+
   const sSmooth = 1 - ramp(sigmaFlat, BANDS.noiseSmooth.lo, BANDS.noiseSmooth.hi);
-  const sSpread = ramp(flatCv, BANDS.noiseSpread.lo, BANDS.noiseSpread.hi);
-  const score = clamp(0.65 * sSmooth + 0.35 * sSpread, 0, 1);
+  const sLowSpread = ramp(
+    BANDS.noiseUniform.lo - flatCv,
+    0,
+    BANDS.noiseUniform.lo - BANDS.noiseUniform.hi,
+  );
+  const sHighSpread = ramp(flatCv, BANDS.noiseSpread.lo, BANDS.noiseSpread.hi);
+  const sSpread = Math.max(sLowSpread, sHighSpread);
+  const sJump = ramp(jump, BANDS.noiseJump.lo, BANDS.noiseJump.hi);
+  const score = clamp(0.45 * sSmooth + 0.3 * sSpread + 0.25 * sJump, 0, 1);
   const status: Check["status"] =
     flatIdx.length < 4 ? "skip" : score >= 0.65 ? "flag" : score >= 0.4 ? "warn" : "ok";
 
   const finding =
     flatIdx.length < 4
       ? "Too few flat regions to measure a reliable noise floor; check skipped."
-      : `Flat-region noise σ = ${sigmaFlat.toFixed(2)} (camera-sourced images typically measure ≈ 0.9–6.0 after downscaling); noise varies across flat tiles with CV = ${flatCv.toFixed(2)}. ` +
-        (sSmooth > 0.5
-          ? "The noise floor is far smoother than a camera sensor pipeline produces — consistent with heavy denoising or synthesis."
-          : sSpread > 0.5
-            ? "Noise is unusually uneven between flat regions — consistent with local edits or compositing."
-            : "Noise floor and spread sit within the range expected from camera-sourced images.");
+      : `Flat-region noise σ = ${sigmaFlat.toFixed(2)}, spread across flat tiles CV = ${flatCv.toFixed(2)}, ` +
+        `largest band-to-band noise step = ${jump.toFixed(2)}× the floor. ` +
+        (sJump > 0.5
+          ? "The noise field steps sharply across the frame — a classic compositing/splice seam."
+          : sSmooth > 0.5
+            ? "Noise floor is below what a JPEG of camera-sourced content retains — consistent with heavy denoising or synthesis."
+            : sSpread > 0.5
+              ? "Noise is unusually even (or uneven) between flat regions — consistent with a synthetic or locally edited noise field."
+              : "Noise floor, spread and band continuity sit within ranges expected from camera-sourced images.");
 
   return {
     check: check({
@@ -136,13 +183,13 @@ function noiseCheck(g: Gray, tiles: ReturnType<typeof tileStats>): {
       label: "Noise residual (sensor grain)",
       group: "signal",
       raw: sigmaFlat,
-      display: `σ ${sigmaFlat.toFixed(2)} · CV ${flatCv.toFixed(2)}`,
+      display: `σ ${sigmaFlat.toFixed(2)} · CV ${flatCv.toFixed(2)} · jump ${jump.toFixed(2)}`,
       score,
       weight: status === "skip" ? 0 : WEIGHTS.noise,
       status,
       finding,
     }),
-    stats: { sigmaFlat, flatCv, coverage },
+    stats: { sigmaFlat, flatCv, coverage, jump },
   };
 }
 
@@ -312,17 +359,36 @@ function gridCheck(
   const phase = Math.sqrt(cr * cr + ci * ci); // 1 = perfectly aligned bands
   const strength = mean(amps);
 
+  // Without a detectable grid (the content was resampled, or it never was a
+  // JPEG) alignment cannot be measured — skip instead of guessing.
+  if (strength < BANDS.gridStrength.lo) {
+    return {
+      check: check({
+        id: "grid",
+        label: "JPEG block-grid alignment",
+        group: "compression",
+        raw: strength,
+        display: `not detectable (×${strength.toFixed(2)})`,
+        status: "skip",
+        weight: 0,
+        score: 0.5,
+        finding:
+          "No 8-px block grid is detectable (content was likely resized/resampled at some point), so grid alignment cannot be measured. Neutral — not evidence either way.",
+      }),
+      stats: { phase, strength },
+    };
+  }
+
   const sPhase = 1 - ramp(phase, BANDS.gridPhase.lo, BANDS.gridPhase.hi);
-  const sStrength = 1 - ramp(strength, BANDS.gridStrength.lo, BANDS.gridStrength.hi);
-  const score = clamp(0.6 * sPhase + 0.4 * sStrength, 0, 1);
+  const score = clamp(sPhase, 0, 1);
   const status: Check["status"] = score >= 0.65 ? "flag" : score >= 0.4 ? "warn" : "ok";
   const finding =
-    `8-px block-grid: cross-band phase consistency = ${phase.toFixed(2)}, modulation strength = ${strength.toFixed(2)}. ` +
+    `8-px block-grid detected (modulation ×${strength.toFixed(2)}): cross-band phase consistency = ${phase.toFixed(2)}. ` +
     (score >= 0.65
-      ? "The JPEG grid is weak or inconsistent across regions — content has likely been resampled, upscaled or composited."
+      ? "A strong grid that disagrees between regions means parts of this image were resampled or composited over an aligned original."
       : score >= 0.4
-        ? "Grid alignment is partially degraded — resampling at some point in the pipeline is likely."
-        : "Block-grid aligns cleanly, as expected from a single-compression camera/web JPEG.");
+        ? "Grid alignment is partially degraded — some resampling in the pipeline is likely."
+        : "Block-grid aligns cleanly across the frame, as expected from a single-compression JPEG.");
 
   return {
     check: check({
@@ -407,23 +473,108 @@ function histogramCheck(g: Gray): { check: Check; stats: { gaps: number; longest
   };
 }
 
+/**
+ * Vertical-seam detector: a hard splice leaves a column where a large share
+ * of rows show a strong edge at the same time — something natural imagery
+ * almost never does.
+ */
+function seamCheck(g: Gray): Check {
+  const { data, width: w, height: h } = g;
+  if (w < 64 || h < 64) {
+    return check({
+      id: "seam",
+      label: "Vertical seam continuity",
+      group: "compression",
+      raw: 0,
+      display: "skipped",
+      status: "skip",
+      weight: 0,
+      score: 0.5,
+      finding: "Image too small for seam analysis.",
+    });
+  }
+  const gradThresh = 28;
+  let best = 0;
+  let bestCol = -1;
+  for (let x = 1; x < w - 1; x++) {
+    let hits = 0;
+    for (let y = 0; y < h; y++) {
+      const i = y * w + x;
+      if (Math.abs(data[i] - data[i - 1]) > gradThresh) hits++;
+    }
+    const frac = hits / h;
+    if (frac > best) {
+      best = frac;
+      bestCol = x;
+    }
+  }
+  const score = ramp(best, BANDS.seamCoherence.lo, BANDS.seamCoherence.hi);
+  const status: Check["status"] = score >= 0.65 ? "flag" : score >= 0.4 ? "warn" : "ok";
+  const finding =
+    `Strongest vertical edge column at x=${bestCol} affects ${(best * 100).toFixed(0)}% of rows. ` +
+    (score >= 0.5
+      ? "A near-continuous vertical discontinuity across the frame is the signature of a hard splice or pasted half."
+      : "No column-wise discontinuity — content is spatially continuous.");
+  return check({
+    id: "seam",
+    label: "Vertical seam continuity",
+    group: "compression",
+    raw: best,
+    display: `${(best * 100).toFixed(0)}% rows @ x=${bestCol}`,
+    score: clamp(score, 0, 1),
+    weight: WEIGHTS.seam,
+    status,
+    finding,
+  });
+}
+
 function elaCheck(
   g: Gray,
   ela: Float32Array,
+  qf: number | null,
+  format: MediaFormat,
 ): { check: Check } {
+  const w = g.width;
+  const h = g.height;
   const m = mean(ela);
-  const p95 = percentile(ela, 95);
-  const ratio = p95 / (m + 0.5);
+
+  // tile-level distribution: localized anomalies lift the tail even when a
+  // thin seam barely moves whole-image statistics
+  const tile = 32;
+  const cols = Math.max(1, Math.floor(w / tile));
+  const rows = Math.max(1, Math.floor(h / tile));
+  const tileMeans: number[] = [];
+  for (let ty = 0; ty < rows; ty++) {
+    for (let tx = 0; tx < cols; tx++) {
+      let sum = 0;
+      let n = 0;
+      for (let y = ty * tile; y < Math.min(h, (ty + 1) * tile); y += 2) {
+        for (let x = tx * tile; x < Math.min(w, (tx + 1) * tile); x += 2) {
+          sum += ela[y * w + x];
+          n++;
+        }
+      }
+      if (n) tileMeans.push(sum / n);
+    }
+  }
+  const ratio = percentile(tileMeans, 90) / (median(tileMeans) + 0.3);
   const sLocal = ramp(ratio, BANDS.elaLocalized.lo, BANDS.elaLocalized.hi);
-  const sSmooth = ramp(BANDS.elaSmooth.hi - m, 0, BANDS.elaSmooth.hi - BANDS.elaSmooth.lo);
-  const score = clamp(0.6 * sLocal + 0.4 * sSmooth, 0, 1);
+
+  // Absolute mean error only means something for a high-quality original:
+  // a heavily-compressed source barely changes when re-encoded.
+  const qualityGate = format === "jpeg" && qf !== null && qf >= 85;
+  const sSmooth = qualityGate
+    ? ramp(BANDS.elaSmooth.hi - m, 0, BANDS.elaSmooth.hi - BANDS.elaSmooth.lo)
+    : 0;
+  const score = clamp(qualityGate ? 0.6 * sLocal + 0.4 * sSmooth : sLocal, 0, 1);
   const status: Check["status"] = score >= 0.65 ? "flag" : score >= 0.4 ? "warn" : "ok";
   const finding =
-    `Error Level Analysis (re-encode q=${ELA_Q}): mean error = ${m.toFixed(2)}, p95/mean concentration = ${ratio.toFixed(1)}. ` +
+    `Error Level Analysis (re-encode q=0.9): mean error = ${m.toFixed(2)}, tile concentration p90/median = ${ratio.toFixed(1)}; ` +
+    `original quality ≈ ${qf ?? "unknown"}${qualityGate ? "" : " (absolute ELA level not evaluated below QF 85)"}. ` +
     (sLocal > 0.5
-      ? "Error energy concentrates in a small region — the classic ELA signature of a pasted or regenerated area."
+      ? "Error energy concentrates in a small set of regions — the classic ELA signature of a pasted, retouched or regenerated area."
       : sSmooth > 0.5
-        ? "Re-encoding barely changes the image — content is unnaturally uniform, as seen in smoothed or generated imagery."
+        ? "Re-encoding a high-quality original barely changes it anywhere — content is unnaturally uniform, as seen in smoothed or generated imagery."
         : "Error energy follows edges evenly, as expected from a consistently encoded photograph.");
 
   return {
@@ -432,7 +583,7 @@ function elaCheck(
       label: "Error Level Analysis",
       group: "compression",
       raw: m,
-      display: `mean ${m.toFixed(2)} · ×${ratio.toFixed(1)}`,
+      display: `mean ${m.toFixed(2)} · tile ×${ratio.toFixed(1)}`,
       score,
       weight: WEIGHTS.ela,
       status,
@@ -567,16 +718,15 @@ export function analyzeFace(
   for (let i = 0; i < ctiles.grad.length; i++) if (ctiles.grad[i] < 10) flat.push(i);
   const faceSigma = flat.length >= 3 ? median(flat.map((i) => ctiles.sigma[i])) : percentile(ctiles.sigma, 30);
   const sigmaRatio = faceSigma / (global.noise.sigmaFlat + 1e-6);
-  const sNoise = 1 - ramp(sigmaRatio, BANDS.faceNoiseRatio.lo, BANDS.faceNoiseRatio.hi);
+  const sNoise = ramp(BANDS.faceNoiseRatio.lo - sigmaRatio, 0, BANDS.faceNoiseRatio.lo - BANDS.faceNoiseRatio.hi);
   checks.push(
     check({
       id: "face-noise",
       label: "Face skin noise vs. frame",
       group: "face",
       raw: sigmaRatio,
-      display: `${(sigmaRatio * 100).toFixed(0)}% of frame σ`,
-      score: clamp(sNoise, 0, 1),
-      weight: 0.35,
+      display: `${(sigmaRatio * 100).toFixed(0)}% of frame σ`,        score: clamp(sNoise, 0, 1),
+        weight: 0.28,
       status: sNoise >= 0.65 ? "flag" : sNoise >= 0.4 ? "warn" : "ok",
       finding:
         `Face noise floor is ${(sigmaRatio * 100).toFixed(0)}% of the frame's (face σ = ${faceSigma.toFixed(2)}, frame σ = ${global.noise.sigmaFlat.toFixed(2)}). ` +
@@ -626,7 +776,7 @@ export function analyzeFace(
         raw: delta,
         display: `ring/interior +${delta.toFixed(2)}`,
         score: clamp(sRing, 0, 1),
-        weight: 0.3,
+        weight: 0.2,
         status: sRing >= 0.65 ? "flag" : sRing >= 0.4 ? "warn" : "ok",
         finding:
           `ELA energy on the face border is ${ringRel.toFixed(2)}× the global mean vs ${inRel.toFixed(2)}× in its interior (Δ = ${delta.toFixed(2)}). ` +
@@ -651,6 +801,59 @@ export function analyzeFace(
     );
   }
 
+  /* 2b — ELA level vs the whole frame: a region pasted in from another
+     source/compression history re-encodes very differently from its host. */
+  if (ela) {
+    const gw = global.gray.width;
+    const gh = global.gray.height;
+    const bx0 = clamp(Math.floor(box.x * gw), 0, gw - 1);
+    const by0 = clamp(Math.floor(box.y * gh), 0, gh - 1);
+    const bw = clamp(Math.floor(box.w * gw), 2, gw - bx0);
+    const bh = clamp(Math.floor(box.h * gh), 2, gh - by0);
+    let sum = 0;
+    let n = 0;
+    for (let y = by0; y < by0 + bh; y += 2) {
+      for (let x = bx0; x < bx0 + bw; x += 2) {
+        sum += ela[y * gw + x];
+        n++;
+      }
+    }
+    const globalMean = mean(ela);
+    const rel = n ? sum / n / (globalMean + 0.3) : 1;
+    const sDeficit = ramp(BANDS.faceElaDeficit.lo - rel, 0, BANDS.faceElaDeficit.lo - BANDS.faceElaDeficit.hi);
+    checks.push(
+      check({
+        id: "face-ela-level",
+        label: "Face compression history (ELA level)",
+        group: "face",
+        raw: rel,
+        display: `${(rel * 100).toFixed(0)}% of frame ELA`,
+        score: clamp(sDeficit, 0, 1),
+        weight: 0.2,
+        status: sDeficit >= 0.65 ? "flag" : sDeficit >= 0.4 ? "warn" : "ok",
+        finding:
+          `The face region re-encodes at ${(rel * 100).toFixed(0)}% of the frame's mean ELA error. ` +
+          (sDeficit >= 0.5
+            ? "A large compression-history mismatch means this region almost certainly came from a different source image than its surroundings."
+            : "Face and surroundings share a consistent compression history."),
+      }),
+    );
+  } else {
+    checks.push(
+      check({
+        id: "face-ela-level",
+        label: "Face compression history (ELA level)",
+        group: "face",
+        raw: 0,
+        display: "skipped",
+        score: 0.5,
+        weight: 0,
+        status: "skip",
+        finding: "ELA disabled for this run — compression-history check skipped.",
+      }),
+    );
+  }
+
   /* 3 — spectral detail deficiency inside the face */
   if (crop.width >= 64 && crop.height >= 64) {
     const small = resizeGray(cg, 128, 128);
@@ -669,7 +872,7 @@ export function analyzeFace(
         raw: cSlope,
         display: `Δβ ${deltaSlope.toFixed(2)}`,
         score: clamp(sDetail, 0, 1),
-        weight: 0.2,
+        weight: 0.12,
         status: sDetail >= 0.65 ? "flag" : sDetail >= 0.4 ? "warn" : "ok",
         finding:
           `Face spectral slope β = ${cSlope.toFixed(2)} vs frame β = ${global.spectrum.slope.toFixed(2)}. ` +
@@ -709,7 +912,7 @@ export function analyzeFace(
       raw: gradRatio,
       display: `${(gradRatio * 100).toFixed(0)}% of frame`,
       score: clamp(sGrad, 0, 1),
-      weight: 0.15,
+      weight: 0.2,
       status: sGrad >= 0.65 ? "flag" : sGrad >= 0.4 ? "warn" : "ok",
       finding:
         `Edge density inside the face is ${(gradRatio * 100).toFixed(0)}% of the frame average. ` +
@@ -759,6 +962,8 @@ export function analyzeSignal(
   const g = gridCheck(residual, width, height, format);
   checks.push(g.check);
 
+  checks.push(seamCheck(gray));
+
   const hist = histogramCheck(gray);
   checks.push(hist.check);
 
@@ -772,7 +977,7 @@ export function analyzeSignal(
       const db = Math.abs(rgba[p + 2] - elaReencoded[p + 2]);
       ela[i] = Math.max(dr, dg, db);
     }
-    checks.push(elaCheck(gray, ela).check);
+    checks.push(elaCheck(gray, ela, qualityFrom(metadata), format).check);
   } else if (settings.enableEla) {
     checks.push(
       check({
