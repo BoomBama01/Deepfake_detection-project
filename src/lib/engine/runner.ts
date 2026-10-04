@@ -10,7 +10,9 @@
 import {
   analyzeFace,
   analyzeSignal,
+  buildFaceAggregate,
   ENGINE_INFO,
+  evidenceQuality,
   WEIGHTS,
 } from "./forensics";
 import { FaceDetectorUnavailableError, detectFaces } from "./faces";
@@ -250,45 +252,19 @@ export async function runImage(
   await tick();
 
   const checks = [...sig.checks];
-  let faceScore: number | null = null;
-  if (faces.length > 0) {
-    const area = (f: FaceResult) => f.box.w * f.box.h;
-    const tot = faces.reduce((a, f) => a + area(f), 0) || 1;
-    faceScore = faces.reduce((a, f) => a + f.score * area(f), 0) / tot;
-    const st: FaceResult["checks"][number]["status"] =
-      faceScore >= 0.65 ? "flag" : faceScore >= 0.4 ? "warn" : "ok";
-    checks.push({
-      id: "face",
-      label: "Face manipulation signal",
-      group: "face",
-      raw: faceScore,
-      display: `${(faceScore * 100).toFixed(0)}% lean across ${faces.length} face(s)`,
-      score: faceScore,
-      weight: WEIGHTS.face,
-      status: st,
-      finding:
-        `Weighted across ${faces.length} detected face(s), the face-level measurements lean ${(faceScore * 100).toFixed(0)}% toward manipulation ` +
-        `(per-face detail is in the Faces section). ` +
-        (st === "flag"
-          ? "Skin smoothness, blending boundaries and face spectra all deviate from the surrounding scene."
-          : st === "warn"
-            ? "Some face-level measurements are elevated but not conclusive."
-            : "Face-level measurements sit inside expected ranges."),
-    });
+  const agg = buildFaceAggregate(faces);
+  const faceScore = agg.faceScore;
+  if (agg.check) checks.push(agg.check);
 
-    /* When faces dominate the frame, the whole-image checks are measuring the
-       same pixels — down-weight them so the face evidence isn't outvoted by
-       corroboration of itself. */
-    const faceAreaRatio = Math.min(
-      1,
-      faces.reduce((a, f) => a + f.box.w * f.box.h, 0),
-    );
-    if (faceAreaRatio > 0.35) {
-      for (const c of checks) {
-        if (c.id === "face") c.weight = 0.6;
-        else if (c.group === "signal" || c.group === "spectral" || c.id === "ela")
-          c.weight *= 0.4;
-      }
+  /* When faces dominate the frame, the whole-image checks are measuring the
+     same pixels — down-weight them so the face evidence isn't outvoted by
+     corroboration of itself. Skipped when no face voted (portrait frames,
+     detector unavailable): there is no face evidence to protect. */
+  if (agg.dominant) {
+    for (const c of checks) {
+      if (c.id === "face") c.weight = 0.6;
+      else if (c.group === "signal" || c.group === "spectral" || c.id === "ela")
+        c.weight *= 0.4;
     }
   }
 
@@ -298,6 +274,7 @@ export async function runImage(
     faceScore,
     kind: "image",
     sensitivity: settings.sensitivity,
+    evidence: evidenceQuality(sig.sharpness, metadata),
   });
   const score = decision.score;
 
@@ -578,10 +555,15 @@ export async function runVideo(
     frameFaces.push(faces);
 
     let faceScore: number | null = null;
-    if (faces.length) {
+    const measured = faces.filter((f) =>
+      f.checks.some((c) => c.weight > 0 && c.status !== "skip"),
+    );
+    if (measured.length) {
       const area = (f: FaceResult) => f.box.w * f.box.h;
-      const tot = faces.reduce((a, f) => a + area(f), 0) || 1;
-      faceScore = faces.reduce((a, f) => a + f.score * area(f), 0) / tot;
+      const tot = measured.reduce((a, f) => a + area(f), 0) || 1;
+      faceScore = measured.reduce((a, f) => a + f.score * area(f), 0) / tot;
+    }
+    if (faces.length) {
       const box = faces[0].box;
       if (prevBox) {
         const dx = box.x + box.w / 2 - (prevBox.x + prevBox.w / 2);

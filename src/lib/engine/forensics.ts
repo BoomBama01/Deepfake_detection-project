@@ -27,7 +27,7 @@ import {
   tileStats,
 } from "./dsp";
 import { type MediaFormat } from "./metadata";
-import type { AnalysisSettings, Check, FaceBox, MetadataFindings } from "./types";
+import type { AnalysisSettings, Check, FaceBox, FaceResult, MetadataFindings } from "./types";
 
 /** Contribution weights of each check to the combined score. */
 export const WEIGHTS = {
@@ -89,10 +89,63 @@ export interface SignalAnalysis {
   spectrum: { slope: number; hfRatio: number; peak: number };
   grid: { phase: number; strength: number } | null;
   histogram: { gaps: number; longestRun: number; clipHigh: number; clipLow: number };
+  /** p90 tile gradient — global sharpness/detail level (evidence quality) */
+  sharpness: number;
   metadata: MetadataFindings | null;
 }
 
 const ELA_Q = 0.9;
+
+/**
+ * Evidence-quality bands — when these say the evidence base is compromised,
+ * the verdict layer must not claim "Real" (absence of signals in a washed-out
+ * file means nothing). Bands measured on the bundled samples plus simulated
+ * social-media transforms (scripts/measure-bands.ts):
+ *   natural photos p90-grad 102–182 · blurred 33–90 · down/up-scaled 41–135
+ *   platform recompression sits at QF 75–90; ≤ 65 is aggressive re-encoding.
+ * Soft-but-authentic images therefore come back Inconclusive, not Real —
+ * an abstention, never a false accusation.
+ */
+export const EVIDENCE = {
+  /** JPEG quality at/below which quantization destroys HF forensics */
+  heavyJpegQf: 65,
+  /** p90 tile gradient below which blur/resampling has washed the evidence */
+  minSharpness: 95,
+} as const;
+
+export interface EvidenceQuality {
+  degraded: boolean;
+  reasons: string[];
+}
+
+/** Measure whether the pixel evidence is still trustworthy. */
+export function evidenceQuality(
+  sharpness: number,
+  metadata: MetadataFindings | null,
+): EvidenceQuality {
+  const reasons: string[] = [];
+  const raw = metadata?.tags["EstimatedJpegQuality"];
+  const qf = raw !== undefined && Number.isFinite(Number(raw)) ? Number(raw) : null;
+  if (qf !== null && qf <= EVIDENCE.heavyJpegQf) {
+    reasons.push(
+      `heavy recompression (JPEG quality ≈ ${qf} ≤ ${EVIDENCE.heavyJpegQf}) has discarded most high-frequency detail the checks rely on`,
+    );
+  }
+  if (sharpness < EVIDENCE.minSharpness) {
+    reasons.push(
+      `low sharpness (p90 tile gradient ${sharpness.toFixed(0)} < ${EVIDENCE.minSharpness}) — the frame is blurred or resampled and fine-grained evidence is washed out`,
+    );
+  }
+  return { degraded: reasons.length > 0, reasons };
+}
+
+/**
+ * JPEG quality at which “no EXIF + no content credentials” stops being
+ * routine web compression and starts looking like programmatic output:
+ * cameras and social platforms re-encode at ≈75–90, generator pipelines and
+ * high-quality saves write ≥93. Inference about provenance, not proof.
+ */
+export const PROVENANCE_MIN_QF = 96;
 
 function qualityFrom(metadata: MetadataFindings | null): number | null {
   const raw = metadata?.tags["EstimatedJpegQuality"];
@@ -493,35 +546,56 @@ function seamCheck(g: Gray): Check {
       finding: "Image too small for seam analysis.",
     });
   }
-  const gradThresh = 28;
-  let best = 0;
+  /* Two-tier measurement: a hard splice survives recompression with a strong
+     (Δ>28) step, but after a downscale/blur the boundary softens to Δ≈12–28.
+     The loose tier uses a stricter *fraction* band so natural vertical
+     structure (door frames, horizons) never reaches it — measured: natural
+     images peak at 39–51% of rows at Δ>12, a resized splice still shows 72%. */
+  const strongThresh = 28;
+  const looseThresh = 12;
+  let bestStrong = 0;
+  let bestLoose = 0;
   let bestCol = -1;
+  let bestLooseCol = -1;
   for (let x = 1; x < w - 1; x++) {
-    let hits = 0;
+    let hitsStrong = 0;
+    let hitsLoose = 0;
     for (let y = 0; y < h; y++) {
       const i = y * w + x;
-      if (Math.abs(data[i] - data[i - 1]) > gradThresh) hits++;
+      const d = Math.abs(data[i] - data[i - 1]);
+      if (d > strongThresh) hitsStrong++;
+      if (d > looseThresh) hitsLoose++;
     }
-    const frac = hits / h;
-    if (frac > best) {
-      best = frac;
+    const fracS = hitsStrong / h;
+    const fracL = hitsLoose / h;
+    if (fracS > bestStrong) {
+      bestStrong = fracS;
       bestCol = x;
     }
+    if (fracL > bestLoose) {
+      bestLoose = fracL;
+      bestLooseCol = x;
+    }
   }
-  const score = ramp(best, BANDS.seamCoherence.lo, BANDS.seamCoherence.hi);
+  const sStrong = ramp(bestStrong, BANDS.seamCoherence.lo, BANDS.seamCoherence.hi);
+  const sLoose = ramp(bestLoose, 0.5, 0.8);
+  const score = clamp(Math.max(sStrong, sLoose), 0, 1);
   const status: Check["status"] = score >= 0.65 ? "flag" : score >= 0.4 ? "warn" : "ok";
   const finding =
-    `Strongest vertical edge column at x=${bestCol} affects ${(best * 100).toFixed(0)}% of rows. ` +
-    (score >= 0.5
+    `Strongest vertical edge column at x=${bestCol} affects ${(bestStrong * 100).toFixed(0)}% of rows (Δ>28); ` +
+    `softest-grade version at x=${bestLooseCol} affects ${(bestLoose * 100).toFixed(0)}% of rows (Δ>12). ` +
+    (sStrong >= 0.5
       ? "A near-continuous vertical discontinuity across the frame is the signature of a hard splice or pasted half."
-      : "No column-wise discontinuity — content is spatially continuous.");
+      : sLoose >= 0.5
+        ? "The boundary is softer (consistent with a resized or recompressed splice) but still crosses most rows — spatial continuity is broken."
+        : "No column-wise discontinuity — content is spatially continuous.");
   return check({
     id: "seam",
     label: "Vertical seam continuity",
     group: "compression",
-    raw: best,
-    display: `${(best * 100).toFixed(0)}% rows @ x=${bestCol}`,
-    score: clamp(score, 0, 1),
+    raw: Math.max(bestStrong, bestLoose),
+    display: `${(bestStrong * 100).toFixed(0)}% rows @ x=${bestCol} · soft ${(bestLoose * 100).toFixed(0)}%`,
+    score,
     weight: WEIGHTS.seam,
     status,
     finding,
@@ -594,6 +668,7 @@ function elaCheck(
 
 export function metadataCheck(md: MetadataFindings): Check {
   const editor = /photoshop|gimp|lightroom|snapseed|facetune|picsart|canva|capcut|premiere|final cut/i;
+  const qf = qualityFrom(md);
   let score = 0.5;
   let status: Check["status"] = "warn";
   let finding: string;
@@ -614,6 +689,13 @@ export function metadataCheck(md: MetadataFindings): Check {
     score = 0.45;
     status = "warn";
     finding = "C2PA Content Credentials detected. Verify the signed claims at contentcredentials.org — presence alone neither proves nor disproves generation.";
+  } else if (!md.hasExif && !md.c2pa && qf !== null && qf >= PROVENANCE_MIN_QF) {
+    score = 0.68;
+    status = "flag";
+    finding =
+      "JPEG quantization tables show near-lossless encoding while the file carries no EXIF and no content credentials. " +
+      "Cameras and social platforms re-encode at much lower quality and keep provenance — a stripped, near-lossless JPEG is the " +
+      "signature of a programmatic render or a saved generator output. This is provenance inference, not proof of generation.";
   } else if (!md.hasExif) {
     score = 0.55;
     status = "warn";
@@ -667,6 +749,43 @@ function cropRgba(
   return { data: out, width: cw, height: ch };
 }
 
+/**
+ * Grow a detector box by `rel` on every side before cropping. BlazeFace
+ * returns a *tight* face box, but the evidence lives just outside it: the
+ * hairline, the jaw/neck edge and — for composites — the paste boundary.
+ * Clamped so the expanded crop never leaves the frame.
+ */
+export function expandBox(box: FaceBox, rel = 0.2, cap = 0.05): FaceBox {
+  const mx = Math.min(box.w * rel, cap);
+  const my = Math.min(box.h * rel, cap);
+  let x = box.x - mx;
+  let y = box.y - my;
+  let w = box.w + 2 * mx;
+  let h = box.h + 2 * my;
+  if (x < 0) {
+    w += x;
+    x = 0;
+  }
+  if (y < 0) {
+    h += y;
+    y = 0;
+  }
+  if (x + w > 1) w = 1 - x;
+  if (y + h > 1) h = 1 - y;
+  return { x, y, w, h };
+}
+
+/**
+ * True when the face box covers most of the frame (portrait/headshot).
+ * Every face check in this engine is *relative to the frame* — when the
+ * frame is the face, each ratio collapses to ≈1 and would always report
+ * "consistent with the surroundings". Those checks are skipped instead of
+ * silently returning a fake all-clear.
+ */
+export function isPortraitFrame(box: FaceBox): boolean {
+  return box.w * box.h >= 0.45;
+}
+
 export interface FaceCheckResult {
   score: number;
   confidence: number;
@@ -686,9 +805,37 @@ export function analyzeFace(
   global: SignalAnalysis,
   ela: Float32Array | null,
 ): FaceCheckResult {
+  /* Measurement crops use the *tight* detector box: face-vs-frame ratios
+     (edge density, skin noise) must stay face-local — diluting them with
+     margin background measurably weakens a real composite flag (edge density
+     0.85 → 0.50 when measured on a 40%-larger crop). The margin matters for
+     boundary context, so the ELA ring/level regions below use `ebox`. */
+  const ebox = expandBox(box);
   const crop = cropRgba(rgba, w, h, box);
   const cg = grayFromRgba(crop.data, crop.width, crop.height);
   const checks: Check[] = [];
+
+  /* Portrait frames: face-vs-frame would compare the face with itself. */
+  if (isPortraitFrame(box)) {
+    return {
+      score: 0.5,
+      confidence: 0,
+      checks: [
+        check({
+          id: "face-applicability",
+          label: "Face-vs-frame comparison",
+          group: "face",
+          raw: box.w * box.h,
+          display: `${Math.round(box.w * box.h * 100)}% of frame`,
+          score: 0.5,
+          weight: 0,
+          status: "skip",
+          finding:
+            "The face occupies most of this frame (portrait/headshot), so face-vs-frame measurements would compare the face with itself and always claim consistency. Skipped — whole-frame checks and metadata carry this result instead.",
+        }),
+      ],
+    };
+  }
 
   if (crop.width < 40 || crop.height < 40) {
     return {
@@ -740,10 +887,10 @@ export function analyzeFace(
   if (ela) {
     const gw = global.gray.width;
     const gh = global.gray.height;
-    const bx0 = clamp(Math.floor(box.x * gw), 0, gw - 1);
-    const by0 = clamp(Math.floor(box.y * gh), 0, gh - 1);
-    const bw = clamp(Math.floor(box.w * gw), 2, gw - bx0);
-    const bh = clamp(Math.floor(box.h * gh), 2, gh - by0);
+    const bx0 = clamp(Math.floor(ebox.x * gw), 0, gw - 1);
+    const by0 = clamp(Math.floor(ebox.y * gh), 0, gh - 1);
+    const bw = clamp(Math.floor(ebox.w * gw), 2, gw - bx0);
+    const bh = clamp(Math.floor(ebox.h * gh), 2, gh - by0);
     let ringSum = 0;
     let ringN = 0;
     let inSum = 0;
@@ -806,10 +953,10 @@ export function analyzeFace(
   if (ela) {
     const gw = global.gray.width;
     const gh = global.gray.height;
-    const bx0 = clamp(Math.floor(box.x * gw), 0, gw - 1);
-    const by0 = clamp(Math.floor(box.y * gh), 0, gh - 1);
-    const bw = clamp(Math.floor(box.w * gw), 2, gw - bx0);
-    const bh = clamp(Math.floor(box.h * gh), 2, gh - by0);
+    const bx0 = clamp(Math.floor(ebox.x * gw), 0, gw - 1);
+    const by0 = clamp(Math.floor(ebox.y * gh), 0, gh - 1);
+    const bw = clamp(Math.floor(ebox.w * gw), 2, gw - bx0);
+    const bh = clamp(Math.floor(ebox.h * gh), 2, gh - by0);
     let sum = 0;
     let n = 0;
     for (let y = by0; y < by0 + bh; y += 2) {
@@ -933,6 +1080,88 @@ export function analyzeFace(
   return { score, confidence, checks };
 }
 
+export interface FaceAggregate {
+  /** area-weighted mean over *measured* faces, or null when none measured */
+  faceScore: number | null;
+  /** the combined "face" check to feed the verdict, or null when absent */
+  check: Check | null;
+  /** whether measured faces cover > 0.35 of the frame (reweight applies) */
+  dominant: boolean;
+}
+
+/**
+ * Combine per-face results into the single face check the verdict uses.
+ * Faces whose inner checks are all skipped (portrait frames where
+ * face-vs-frame is self-referential, or crops too small to measure) do not
+ * vote: previously they injected a neutral score that diluted real evidence
+ * and could drag the combined score toward "Real".
+ */
+export function buildFaceAggregate(faces: FaceResult[]): FaceAggregate {
+  const measured = faces.filter((f) =>
+    f.checks.some((c) => c.weight > 0 && c.status !== "skip"),
+  );
+  if (measured.length === 0) {
+    return { faceScore: null, check: null, dominant: false };
+  }
+  const area = (f: FaceResult) => f.box.w * f.box.h;
+  const tot = measured.reduce((a, f) => a + area(f), 0) || 1;
+  const faceScore = measured.reduce((a, f) => a + f.score * area(f), 0) / tot;
+  /* Status must also honour the *worst* sub-check: a decisive flag (e.g. face
+     edge density 0.85) used to be averaged with four passing sub-checks into
+     a harmless-looking 0.36 and never reached the verdict. */
+  const worst = Math.max(
+    0,
+    ...measured.flatMap((f) =>
+      f.checks
+        .filter((c) => c.weight > 0 && c.status !== "skip")
+        .map((c) => c.score),
+    ),
+  );
+  const worstCheck = measured
+    .flatMap((f) => f.checks)
+    .filter((c) => c.weight > 0 && c.status !== "skip")
+    .reduce<Check | null>((best, c) => (!best || c.score > best.score ? c : best), null);
+  /* Status honours the *worst* sub-check at the engine's standard flag level
+     (≥0.65): a decisive flag (e.g. face edge density 0.75 after a resize)
+     used to be averaged into a harmless 0.25 and never reached the verdict.
+     `raw` carries the worst sub-score so the verdict layer can tier it. */
+  const status: Check["status"] =
+    faceScore >= 0.65 || worst >= 0.65
+      ? "flag"
+      : faceScore >= 0.4 || worst >= 0.4
+        ? "warn"
+        : "ok";
+  const check: Check = {
+    id: "face",
+    label: "Face manipulation signal",
+    group: "face",
+    raw: worst,
+    display:
+      worst >= 0.65 && worst > faceScore
+        ? `${(faceScore * 100).toFixed(0)}% mean · ${worstCheck?.label ?? "sub-check"} ${(worst * 100).toFixed(0)}%`
+        : `${(faceScore * 100).toFixed(0)}% lean across ${measured.length} face(s)`,
+    score: faceScore,
+    weight: WEIGHTS.face,
+    status,
+    finding:
+      `Weighted across ${measured.length} measured face(s), face-level measurements lean ` +
+      `${(faceScore * 100).toFixed(0)}% toward manipulation (per-face detail is in the Faces section). ` +
+      (worst >= 0.4
+        ? `Strongest single measurement: ${worstCheck?.label ?? "a face check"} at ${(worst * 100).toFixed(0)}%${
+            worst >= 0.8 ? " — decisive evidence of face manipulation." : "."
+          }`
+        : "Face-level measurements sit inside expected ranges.") +
+      (measured.length < faces.length
+        ? ` ${faces.length - measured.length} detected face(s) were skipped (portrait frame or crop too small) and do not vote.`
+        : ""),
+  };
+  return {
+    faceScore,
+    check,
+    dominant: measured.reduce((a, f) => a + area(f), 0) > 0.35,
+  };
+}
+
 /* ------------------------------------------------------------------ */
 /* Full image signal analysis                                          */
 /* ------------------------------------------------------------------ */
@@ -950,6 +1179,7 @@ export function analyzeSignal(
   const residual = highPass(gray);
   const grad = sobelMag(gray);
   const tiles = tileStats(gray, residual, grad, 32);
+  const sharpness = percentile(tiles.grad, 90);
 
   const checks: Check[] = [];
 
@@ -1006,6 +1236,7 @@ export function analyzeSignal(
     spectrum: s.stats,
     grid: g.stats,
     histogram: hist.stats,
+    sharpness,
     metadata,
   };
 }

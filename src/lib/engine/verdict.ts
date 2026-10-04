@@ -2,7 +2,7 @@
  * TruthLens engine — verdict decision.
  *
  * Deterministic: thresholds depend only on the sensitivity setting and the
- * measured checks. Two documented rules shape the combined score:
+ * measured checks. Four documented rules shape the combined score:
  *
  *  1. WEAK-AUTHENTICITY FLOOR — a check that simply *passes* only rules
  *     fakery out weakly (a measurement inside the natural range can also be
@@ -11,6 +11,14 @@
  *  2. STRUCTURAL EVIDENCE — a direct, high-confidence signal (known
  *     generator signatures embedded in metadata) floors the score at 0.72,
  *     because such evidence does not need statistical corroboration.
+ *  3. FLAG VETO — a check that actively fired (status "flag") can never be
+ *     averaged away into "Real": the score is floored into the inconclusive
+ *     band, and decisive face evidence (worst face measurement ≥ 0.80)
+ *     floors at the synthetic threshold, yielding Likely deepfake.
+ *  4. EVIDENCE QUALITY — when the file is heavily recompressed (JPEG ≤ 65)
+ *     or blurred/resampled (p90 gradient < 95), absence of manipulation
+ *     signals proves nothing, so a "Real" verdict is withheld (→
+ *     Inconclusive) and confidence is capped at 50%.
  *
  * Confidence reflects distance from the decision boundary plus agreement
  * between checks, and is capped below 100 — no detector is perfect.
@@ -22,6 +30,8 @@ import type { Check, Sensitivity, Verdict } from "./types";
 
 export const OK_SCORE_FLOOR = 0.3;
 export const STRUCTURAL_FLOOR = 0.72;
+/** confidence range that is reported as "Uncertain" rather than a firm number */
+export const UNCERTAIN_BAND = { lo: 40, hi: 60 } as const;
 
 export const THRESHOLDS: Record<Sensitivity, { real: number; fake: number }> = {
   low: { real: 0.3, fake: 0.75 },
@@ -43,6 +53,12 @@ export interface VerdictInput {
   faceScore: number | null;
   kind: "image" | "video";
   sensitivity: Sensitivity;
+  /**
+   * Evidence-quality assessment (measured sharpness + compression level).
+   * When the evidence base is compromised the verdict may not be "Real":
+   * absence of manipulation signals in a washed-out file proves nothing.
+   */
+  evidence?: { degraded: boolean; reasons: string[] };
 }
 
 export interface VerdictDecision {
@@ -50,12 +66,27 @@ export interface VerdictDecision {
   confidence: number;
   /** combined score after floor/override rules — the number shown in the UI */
   score: number;
+  /** confidence sits inside the 40–60% band: label is provisional */
+  uncertainBand: boolean;
   explanation: string[];
 }
 
 export function decideVerdict(input: VerdictInput): VerdictDecision {
-  const { checks, faceScore, kind, sensitivity } = input;
-  const t = THRESHOLDS[sensitivity];
+  return decideCore(input, THRESHOLDS[input.sensitivity], input.sensitivity);
+}
+
+/**
+ * Decision core with explicit thresholds, exported so the calibration
+ * script (scripts/calibrate.ts) can sweep (real, fake) pairs through the
+ * *exact* production logic — including the flag-veto floors, which depend
+ * on the thresholds themselves.
+ */
+export function decideCore(
+  input: Omit<VerdictInput, "sensitivity">,
+  t: { real: number; fake: number },
+  label: string,
+): VerdictDecision {
+  const { checks, faceScore, kind } = input;
   const active = checks.filter((c) => c.weight > 0 && c.status !== "skip");
 
   const explanation: string[] = [];
@@ -65,6 +96,7 @@ export function decideVerdict(input: VerdictInput): VerdictDecision {
       verdict: "error",
       confidence: 0,
       score: 0.5,
+      uncertainBand: false,
       explanation: [
         "Too few checks completed to produce a verdict. The file may have failed to decode, or the enabled checks were skipped. No result is guessed — run the analysis again or try another file.",
       ],
@@ -88,6 +120,38 @@ export function decideVerdict(input: VerdictInput): VerdictDecision {
     );
   }
 
+  /* rule 3 — a flagged check vetoes "Real".
+     Before this rule a single strong flag (e.g. face edge density 0.85) was
+     averaged with a dozen passing checks and the file still came back
+     "Real" with high confidence. Passing checks can never outweigh a
+     measurement that actively fired. */
+  const flags = active.filter((c) => c.status === "flag");
+  let faceDecisive = false;
+  let blockedReal = false;
+  if (flags.length > 0) {
+    const faceFlag = flags.find((c) => c.group === "face");
+    const decisiveFace = flags.find((c) => c.group === "face" && c.raw >= 0.8);
+    if (decisiveFace) {
+      faceDecisive = true;
+      score = Math.max(score, t.fake);
+      explanation.push(
+        `Decisive face evidence: ${decisiveFace.finding} A face measurement at ${decisiveFace.raw.toFixed(2)} (≥ 0.80) is direct manipulation evidence, so the score is floored at the ${label} synthetic threshold (${t.fake.toFixed(2)}).`,
+      );
+    } else {
+      const floor = (t.real + t.fake) / 2 + 0.01;
+      score = Math.max(score, floor);
+      if (faceFlag) {
+        explanation.push(
+          `Flagged face measurement: ${faceFlag.finding} The score is floored into the inconclusive band at ${floor.toFixed(2)} — strong but not decisive face evidence, so the result is reported as Inconclusive rather than guessed.`,
+        );
+      } else {
+        explanation.push(
+          `Flagged measurement(s): ${flags.map((c) => c.label).join(", ")} — a check that actively fired vetoes a “Real” verdict, so the score is floored into the inconclusive band at ${floor.toFixed(2)}.`,
+        );
+      }
+    }
+  }
+
   /* confidence: distance from the boundary × agreement between checks */
   const wsum = floored.reduce((a, c) => a + c.weight, 0) || 1;
   const mu = floored.reduce((a, c) => a + c.score * c.weight, 0) / wsum;
@@ -101,10 +165,12 @@ export function decideVerdict(input: VerdictInput): VerdictDecision {
 
   let verdict: Verdict;
   if (score >= t.fake) {
-    const faceHeavy = faceScore !== null && faceScore >= Math.min(t.fake + 0.02, score + 0.05);
+    const faceHeavy =
+      faceDecisive ||
+      (faceScore !== null && faceScore >= Math.min(t.fake + 0.02, score + 0.05));
     verdict = faceHeavy ? "likely_deepfake" : "likely_ai";
     explanation.push(
-      `Combined synthetic-lean score ${score.toFixed(2)} is above the ${sensitivity} threshold of ${t.fake.toFixed(2)} for this run.`,
+      `Combined synthetic-lean score ${score.toFixed(2)} is above the ${label} threshold of ${t.fake.toFixed(2)} for this run.`,
     );
     if (verdict === "likely_deepfake") {
       explanation.push(
@@ -116,10 +182,20 @@ export function decideVerdict(input: VerdictInput): VerdictDecision {
       );
     }
   } else if (score <= t.real) {
-    verdict = "real";
-    explanation.push(
-      `Combined synthetic-lean score ${score.toFixed(2)} is below the ${sensitivity} threshold of ${t.real.toFixed(2)}; active checks sit within ranges expected from camera-sourced media.`,
-    );
+    if (input.evidence?.degraded) {
+      verdict = "inconclusive";
+      blockedReal = true;
+      score = Math.max(score, t.real + 0.02);
+      explanation.push(
+        `Evidence degraded — ${input.evidence.reasons.join("; ")}. ` +
+          "In these conditions ‘no manipulation signals found’ does not mean ‘authentic’, so a Real verdict is withheld and the file is reported Inconclusive.",
+      );
+    } else {
+      verdict = "real";
+      explanation.push(
+        `Combined synthetic-lean score ${score.toFixed(2)} is below the ${label} threshold of ${t.real.toFixed(2)}; active checks sit within ranges expected from camera-sourced media.`,
+      );
+    }
   } else {
     verdict = "inconclusive";
     explanation.push(
@@ -141,5 +217,25 @@ export function decideVerdict(input: VerdictInput): VerdictDecision {
   );
 
   confidence = clamp(confidence, 10, 97);
-  return { verdict, confidence: Math.round(confidence * 10) / 10, score, explanation };
+  if (blockedReal) confidence = Math.min(confidence, 50);
+  const rounded = Math.round(confidence * 10) / 10;
+  const uncertainBand =
+    rounded >= UNCERTAIN_BAND.lo && rounded <= UNCERTAIN_BAND.hi;
+  if (uncertainBand) {
+    explanation.push(
+      `Confidence ${rounded}% sits inside the ${UNCERTAIN_BAND.lo}–${UNCERTAIN_BAND.hi}% uncertain band: the label above is provisional, not a firm call.`,
+    );
+  } else if (verdict === "inconclusive") {
+    explanation.push(
+      "Inconclusive means the evidence genuinely does not decide — treat this as " +
+        "‘not established either way’, never as a pass for the file.",
+    );
+  }
+  return {
+    verdict,
+    confidence: rounded,
+    score,
+    uncertainBand,
+    explanation,
+  };
 }

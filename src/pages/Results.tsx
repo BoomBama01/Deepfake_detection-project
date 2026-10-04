@@ -236,6 +236,15 @@ export default function Results() {
             <div>
               <div className="flex flex-wrap items-center gap-4">
                 <VerdictBadge verdict={verdict} large />
+                {(analysis.confidence >= 40 && analysis.confidence <= 60) ||
+                verdict === "inconclusive" ? (
+                  <span
+                    role="status"
+                    className="rounded border border-[var(--verdict-uncertain)]/60 bg-[var(--verdict-uncertain)]/10 px-2 py-1 font-mono text-[10px] uppercase tracking-[0.18em] text-[var(--verdict-uncertain)]"
+                  >
+                    Uncertain — inside the 40–60% band
+                  </span>
+                ) : null}
                 <div className="font-mono text-xs text-muted-foreground">
                   score {analysis.score.toFixed(3)} · sensitivity {sensitivity}
                 </div>
@@ -638,10 +647,20 @@ export default function Results() {
                   evidence)
                 </li>
                 <li>
+                  any flagged check vetoes Real — score floors into the inconclusive band; the
+                  worst face measurement ≥ 0.80 floors at the synthetic threshold (likely
+                  deepfake)
+                </li>
+                <li>
+                  degraded evidence (JPEG quality ≤ 65 or p90 gradient &lt; 95) withholds Real and
+                  caps confidence at 50%
+                </li>
+                <li>
                   face-dominant images up-weight face checks and scale whole-frame checks ×0.4
                 </li>
                 <li>
-                  confidence = boundary distance × check agreement × coverage, capped at 97%
+                  confidence = boundary distance × check agreement × coverage, capped at 97% (50%
+                  when evidence is degraded)
                 </li>
               </ul>
               <div className="mt-4 overflow-x-auto">

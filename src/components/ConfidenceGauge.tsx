@@ -23,6 +23,12 @@ export function ConfidenceGauge({
   const end = polar(cx, cy, r, 40);
   const arc = `M ${start.x} ${start.y} A ${r} ${r} 0 1 1 ${end.x} ${end.y}`;
   const totalLen = r * (260 * (Math.PI / 180));
+  /* uncertain band: confidence 40–60% is drawn explicitly so a number in
+     that range is never read as a firm call */
+  const bandStart = polar(cx, cy, r, -220 + 0.4 * 260);
+  const bandEnd = polar(cx, cy, r, -220 + 0.6 * 260);
+  const bandArc = `M ${bandStart.x} ${bandStart.y} A ${r} ${r} 0 0 1 ${bandEnd.x} ${bandEnd.y}`;
+  const inBand = clamped >= 40 && clamped <= 60;
   const color =
     verdict === "real"
       ? "var(--verdict-real)"
@@ -57,6 +63,14 @@ export function ConfidenceGauge({
           strokeLinecap="round"
         />
         <path
+          d={bandArc}
+          fill="none"
+          stroke="var(--verdict-uncertain)"
+          strokeOpacity={inBand ? 0.95 : 0.35}
+          strokeWidth={stroke}
+          strokeDasharray={`${(0.2 * totalLen).toFixed(1)} ${(0.2 * totalLen).toFixed(1)}`}
+        />
+        <path
           d={arc}
           fill="none"
           stroke={color}
@@ -75,8 +89,12 @@ export function ConfidenceGauge({
           {clamped.toFixed(0)}
           <span className="text-base">%</span>
         </div>
-        <div className="font-mono text-[10px] uppercase tracking-[0.22em] text-muted-foreground">
-          confidence
+        <div
+          className={`font-mono text-[10px] uppercase tracking-[0.22em] ${
+            inBand ? "text-[var(--verdict-uncertain)]" : "text-muted-foreground"
+          }`}
+        >
+          {inBand ? "uncertain band 40–60%" : "confidence"}
         </div>
       </div>
     </div>
