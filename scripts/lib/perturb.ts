@@ -4,6 +4,7 @@
  * Shared by scripts/robustness-check.ts and the band-measurement runs.
  */
 import jpeg from "jpeg-js";
+import * as PNG_MOD from "pngjs";
 import type { DecodedImage } from "./pipeline";
 
 export function toRgba(img: DecodedImage): Uint8ClampedArray {
@@ -95,4 +96,55 @@ export function encodeJpeg(img: DecodedImage, quality: number): Uint8Array {
     },
     quality,
   ).data;
+}
+
+/** Centre crop to `fraction` of each side, then re-encode. Simulates re-framing. */
+export function cropRgba(img: DecodedImage, fraction = 0.8): DecodedImage {
+  const { width: w, height: h } = img;
+  const cw = Math.max(16, Math.round(w * fraction));
+  const ch = Math.max(16, Math.round(h * fraction));
+  const x0 = Math.floor((w - cw) / 2);
+  const y0 = Math.floor((h - ch) / 2);
+  const src = toRgba(img);
+  const out = new Uint8ClampedArray(cw * ch * 4);
+  for (let y = 0; y < ch; y++) {
+    const from = ((y0 + y) * w + x0) * 4;
+    out.set(src.subarray(from, from + cw * 4), y * cw * 4);
+  }
+  return { data: out, width: cw, height: ch };
+}
+
+/**
+ * Simulate a screenshot: mild downscale, flat-region noise added back (real
+ * captures always carry capture noise), then re-encode. Screenshots are the
+ * single most common way real media reaches a detector, and they destroy most
+ * high-frequency forensic signal — so this is the harshest realistic case.
+ */
+export function screenshotRgba(img: DecodedImage, noise = 1.6): DecodedImage {
+  const scaled = resizeRoundTrip(img, 0.9);
+  const out = new Uint8ClampedArray(scaled.data);
+  // deterministic pseudo-noise (no Math.random — the harness must be repeatable)
+  let seed = 0x9e3779b9;
+  for (let i = 0; i < out.length; i += 4) {
+    seed = (seed * 1664525 + 1013904223) >>> 0;
+    const n = ((seed >>> 24) / 255 - 0.5) * noise;
+    out[i] += n;
+    out[i + 1] += n;
+    out[i + 2] += n;
+  }
+  return { data: out, width: scaled.width, height: scaled.height };
+}
+
+/**
+ * Strip metadata by re-encoding into a fresh PNG: EXIF, C2PA and generator
+ * signatures are all discarded. This is the transform that turns "absent
+ * provenance" into a strong-looking AI hint, so the harness measures whether
+ * the verdict survives it.
+ */
+export function stripMetadata(img: DecodedImage): Uint8Array {
+  const { PNG } = PNG_MOD;
+  const rgba = toRgba(img);
+  const png = new PNG({ width: img.width, height: img.height });
+  png.data = Buffer.from(rgba.buffer, rgba.byteOffset, rgba.length);
+  return new Uint8Array(PNG.sync.write(png));
 }

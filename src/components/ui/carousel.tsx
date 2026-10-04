@@ -91,9 +91,20 @@ function Carousel({
     setApi(api)
   }, [api, setApi])
 
+  /* Sync scroll availability when the api instance changes. Adjusting state
+     during render rather than in an effect avoids a cascading render; the
+     effect below only subscribes to api events. */
+  const [lastApi, setLastApi] = React.useState<CarouselApi | null>(null)
+  if (api !== lastApi) {
+    setLastApi(api)
+    if (api) {
+      setCanScrollPrev(api.canScrollPrev())
+      setCanScrollNext(api.canScrollNext())
+    }
+  }
+
   React.useEffect(() => {
     if (!api) return
-    onSelect(api)
     api.on("reInit", onSelect)
     api.on("select", onSelect)
 

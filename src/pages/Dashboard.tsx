@@ -93,8 +93,7 @@ type ScanRow = {
   fileName: string;
   verdict: "real" | "inconclusive" | "likely_ai" | "likely_deepfake" | "error" | null;
   confidence: number | null;
-  /** stored combined score (legacy rows only — used to place old
-      "inconclusive" rows on their binary side) */
+  /** stored combined synthetic-leaning score */
   score: number | null;
   isPublic: boolean;
   pinned: boolean;
@@ -103,18 +102,24 @@ type ScanRow = {
   fileSize: number | null;
 };
 
+/** The three outcomes plus the failure state. */
 const VERDICT_META: Record<
   string,
   { label: string; short: string; color: string }
 > = {
-  real: { label: "Real", short: "Real", color: "var(--verdict-real)" },  inconclusive: {
-    label: "Low confidence",
-    short: "Low conf.",
+  real: {
+    label: "Likely authentic",
+    short: "Authentic",
+    color: "var(--verdict-real)",
+  },
+  inconclusive: {
+    label: "Inconclusive",
+    short: "Inconclusive",
     color: "var(--verdict-uncertain)",
   },
   likely_ai: {
     label: "Likely AI-generated",
-    short: "AI fake",
+    short: "AI generated",
     color: "var(--verdict-fake)",
   },
   likely_deepfake: {
@@ -123,8 +128,8 @@ const VERDICT_META: Record<
     color: "var(--verdict-fake)",
   },
   error: {
-    label: "Analysis failed",
-    short: "Failed",
+    label: "Analysis unavailable",
+    short: "Unavailable",
     color: "var(--muted-foreground)",
   },
 };
@@ -132,18 +137,20 @@ const VERDICT_META: Record<
 const PLAN_LIMITS: Record<string, number> = { free: 25, pro: 500, team: 2000 };
 
 /**
- * Binary display verdict: the engine only ever returns Real or an AI-side
- * verdict for new scans. Legacy rows may hold "inconclusive"/null from the
- * old three-way engine — resolve those to the side of their stored score so
- * the table always reads Real or AI ("Low confidence" only when no score
- * was stored either).
+ * Display verdict.
+ *
+ * `inconclusive` is a real engine outcome again, so it is shown as itself
+ * rather than being resolved to the side of the stored score — a row the
+ * engine could not settle must not read as a confident call in a list.
+ *
+ * The one case that still needs a fallback is a legacy row with a verdict of
+ * null and no stored score: there is nothing to display and nothing to infer,
+ * so it is shown as inconclusive rather than guessed at.
  */
 function displayVerdict(
   verdict: ScanRow["verdict"],
-  score: number | null,
 ): "real" | "inconclusive" | "likely_ai" | "likely_deepfake" | "error" {
-  if (verdict != null && verdict !== "inconclusive") return verdict;
-  if (score != null) return score >= 0.5 ? "likely_ai" : "real";
+  if (verdict != null) return verdict;
   return "inconclusive";
 }
 
@@ -211,7 +218,7 @@ export default function Dashboard() {
   const createKey = useMutation(api.apiKeys.create);
   const revokeKey = useMutation(api.apiKeys.revoke);
 
-  const rows = (scans ?? []) as ScanRow[];
+  const rows = useMemo(() => (scans ?? []) as ScanRow[], [scans]);
 
   /* ---- history filters ---- */
   const [search, setSearch] = useState("");
@@ -228,7 +235,7 @@ export default function Dashboard() {
     const q = search.trim().toLowerCase();
     let list = rows.filter((r) => {
       if (q && !r.fileName.toLowerCase().includes(q)) return false;
-      if (verdictFilter !== "all" && displayVerdict(r.verdict, r.score) !== verdictFilter)
+      if (verdictFilter !== "all" && displayVerdict(r.verdict) !== verdictFilter)
         return false;
       if (typeFilter !== "all" && r.type !== typeFilter) return false;
       return true;
@@ -258,7 +265,7 @@ export default function Dashboard() {
   /* ---- overview stats ---- */
   const stats = useMemo(() => {
     const count = (v: string) =>
-      rows.filter((r) => displayVerdict(r.verdict, r.score) === v).length;
+      rows.filter((r) => displayVerdict(r.verdict) === v).length;
     const flagged = count("likely_ai") + count("likely_deepfake");
     const real = count("real");
     const withConf = rows.filter((r) => r.confidence != null);
@@ -270,9 +277,12 @@ export default function Dashboard() {
     return { total: rows.length, flagged, real, inconclusive: count("inconclusive"), avg };
   }, [rows]);
 
+  /* "now" is captured once per mount so the 14-day chart is stable across
+     re-renders instead of recomputing a moving window on every render. */
+  const [now] = useState(() => Date.now());
+
   const byDay = useMemo(() => {
     const DAY = 86_400_000;
-    const now = Date.now();
     const out: Array<{ day: string; count: number }> = [];
     for (let i = 13; i >= 0; i--) {
       const d = new Date(now - i * DAY);
@@ -293,14 +303,14 @@ export default function Dashboard() {
       });
     }
     return out;
-  }, [rows]);
+  }, [rows, now]);
 
   const mix = useMemo(() => {
     const order = ["real", "inconclusive", "likely_ai", "likely_deepfake", "error"];
     return order
       .map((v) => ({
         name: VERDICT_META[v].short,
-        value: rows.filter((r) => displayVerdict(r.verdict, r.score) === v).length,
+        value: rows.filter((r) => displayVerdict(r.verdict) === v).length,
         color: VERDICT_META[v].color,
       }))
       .filter((d) => d.value > 0);
@@ -738,7 +748,7 @@ export default function Dashboard() {
                 <SelectContent>
                   <SelectItem value="all">All verdicts</SelectItem>
                   <SelectItem value="real">Real</SelectItem>
-                  <SelectItem value="inconclusive">Low confidence</SelectItem>
+                  <SelectItem value="inconclusive">Inconclusive</SelectItem>
                   <SelectItem value="likely_ai">Likely AI</SelectItem>
                   <SelectItem value="likely_deepfake">Likely deepfake</SelectItem>
                   <SelectItem value="error">Failed</SelectItem>
@@ -916,7 +926,7 @@ export default function Dashboard() {
                               </span>
                             </TableCell>
                             <TableCell>
-                              <VerdictBadge verdict={displayVerdict(row.verdict, row.score)} />
+                              <VerdictBadge verdict={displayVerdict(row.verdict)} />
                             </TableCell>
                             <TableCell className="text-right font-mono tabular-nums">
                               {row.confidence != null

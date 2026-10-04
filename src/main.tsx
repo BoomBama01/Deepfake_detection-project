@@ -15,6 +15,7 @@ const AuthPage = lazy(() => import("./pages/Auth.tsx"));
 const Analyze = lazy(() => import("./pages/Analyze.tsx"));
 const Results = lazy(() => import("./pages/Results.tsx"));
 const Dashboard = lazy(() => import("./pages/Dashboard.tsx"));
+const Developer = lazy(() => import("./pages/Developer.tsx"));
 const Docs = lazy(() => import("./pages/Docs.tsx"));
 const Learn = lazy(() => import("./pages/Learn.tsx"));
 const About = lazy(() => import("./pages/About.tsx"));
@@ -145,6 +146,21 @@ createRoot(document.getElementById("root")!).render(
                 element={
                   <RequireAuth>
                     <Dashboard />
+                  </RequireAuth>
+                }
+              />
+              {/* Developer mode exposes implementation detail that helps someone
+                  craft an evasion, so it is gated. It contains no secrets and no
+                  user data — the gate is about not handing an attacker's playbook
+                  to anonymous visitors. */}
+              <Route
+                path="/developer"
+                element={
+                  <RequireAuth
+                    title="Sign in to view the developer dashboard"
+                    description="Detector versions, fusion weights and calibration provenance are only shown to signed-in users."
+                  >
+                    <Developer />
                   </RequireAuth>
                 }
               />

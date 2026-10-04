@@ -159,7 +159,7 @@ console.log(`                    predicted real   predicted fake   abstain`);
 console.log(`  actual real        ${String(tn).padStart(8)}         ${String(fp).padStart(8)}          ${String(abstainReal).padStart(8)}`);
 console.log(`  actual fake        ${String(fn).padStart(8)}         ${String(tp).padStart(8)}          ${String(abstainFake).padStart(8)}`);
 console.log(``);
-console.log(`  Accuracy (strict, abstentions wrong) : ${pct(tp + tn, total)}`);
+console.log(`  Accuracy (strict, abstentions wrong) : ${(100 * strictAcc).toFixed(1)}%`);
 console.log(`  Coverage (decided / total)           : ${pct(decided, total)}`);
 console.log(`  Precision (of called fake)           : ${pct(tp, tp + fp)}`);
 console.log(`  Recall (of all real fakes)           : ${pct(tp, actualFake.length)}  [abstained fakes count as missed]`);

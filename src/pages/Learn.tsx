@@ -154,7 +154,7 @@ export default function Learn() {
             {[
               {
                 q: "Why is my selfie only around 50% confident?",
-                a: "Heavy phone processing (beauty modes, HDR stacking, recompression) blurs the line between captured and generated. TruthLens still gives you a binary Real or AI call, but honestly caps its confidence when the evidence is borderline instead of inflating the number.",
+                a: "Heavy phone processing (beauty modes, HDR stacking, recompression) blurs the line between captured and generated. TruthLens does not resolve that blur by guessing: where the evidence is genuinely borderline it returns INCONCLUSIVE and tells you which measurements fell apart.",
               },
               {
                 q: "A screenshot lost all its metadata — is it fake?",
@@ -166,7 +166,7 @@ export default function Learn() {
               },
               {
                 q: "Why does a heavily re-compressed or blurry image come back with low confidence?",
-                a: "Recompression and resampling destroy the very traces detection relies on. In that situation ‘nothing found’ would be a false all-clear, so the verdict still leans to the side of its measurement — Real or AI — but its confidence is capped at 50% and flagged as low-confidence, with the explanation naming exactly which evidence was washed out.",
+                a: "Recompression and resampling destroy the very traces detection relies on. In that situation ‘nothing found’ would be a false all-clear, so the verdict becomes INCONCLUSIVE, with the explanation naming exactly which evidence was washed out rather than reporting a pass it cannot support.",
               },
               {
                 q: "Do you store my video?",

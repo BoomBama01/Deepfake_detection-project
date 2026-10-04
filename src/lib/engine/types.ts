@@ -7,12 +7,85 @@
  * marked "skip" / listed in `warnings` instead of being invented.
  */
 
+/**
+ * The engine reports THREE outcomes plus a failure state — never a forced
+ * binary. `inconclusive` is a first-class result: when the evidence is weak,
+ * degraded, or the detectors disagree, that is what is reported.
+ */
 export type Verdict =
   | "real"
   | "inconclusive"
   | "likely_ai"
   | "likely_deepfake"
   | "error";
+
+/** Which of the three outcomes a verdict maps to. */
+export type Outcome = "authentic" | "synthetic" | "inconclusive" | "error";
+
+/**
+ * One measured signal as reported by a detector in the fusion layer.
+ * Mirrors `DetectorSignal` in detectors.ts, duplicated here so the persisted
+ * analysis payload stays a plain serialisable shape with no cross-imports.
+ */
+export interface EvidenceSignal {
+  id: string;
+  label: string;
+  /** evidence family */
+  group: string;
+  /** human-formatted measured value */
+  raw: string;
+  /** 0..1 synthetic-leaning lean */
+  score: number;
+  /** 0..1 fusion weight; 0 means "did not run" */
+  weight: number;
+  /** 0..100 confidence in this signal */
+  confidence: number;
+  /** plain-English evidence quoting the real measured numbers */
+  evidence: string;
+  /** "skip" | "not-applicable" | "ok" | "warn" | "flag" */
+  reliability: "skip" | "not-applicable" | "ok" | "warn" | "flag";
+  detector?: string;
+  detectorVersion?: string;
+}
+
+/** Roll-up of every signal in one evidence family, for the report. */
+export interface EvidenceCategoryReport {
+  id: string;
+  label: string;
+  signals: EvidenceSignal[];
+  flagged: boolean;
+  maxScore: number;
+  weight: number;
+}
+
+/** Per-detector row for the developer/evaluation dashboard. */
+export interface DetectorRunReport {
+  detector: string;
+  version: string;
+  group: string;
+  score: number;
+  confidence: number;
+  reliability: EvidenceSignal["reliability"];
+  ranInMs: number;
+}
+
+/**
+ * The evidence block attached to every analysis. This is what makes the report
+ * explainable: every number in the verdict can be traced to a signal here.
+ */
+export interface EvidenceReport {
+  /** weighted-mean fused score over the signals that actually ran (0..1) */
+  fusionScore: number;
+  categories: EvidenceCategoryReport[];
+  signals: EvidenceSignal[];
+  perDetector: DetectorRunReport[];
+  /** how many detectors contributed a weighted signal */
+  activeDetectors: number;
+  /** 0..1 evidence strength (coverage tempered by agreement) */
+  evidenceStrength: number;
+  /** wall-clock cost of the detector portfolio */
+  elapsedMs: number;
+}
 
 export type Sensitivity = "low" | "balanced" | "high";
 
@@ -109,18 +182,37 @@ export interface EngineInfo {
   checksRun: string[];
 }
 
-export interface ImageAnalysis {
-  kind: "image";
+/**
+ * The three-way verdict block. Shared by image and video analyses so the UI and
+ * the report renderer read exactly the same fields regardless of media type.
+ */
+export interface VerdictBlock {
   verdict: Verdict;
+  /** which of the three outcomes this maps to */
+  outcome: Outcome;
   /** 0..100, always below 100 — no detector is perfect */
   confidence: number;
   /** combined synthetic-leaning score, 0..1 */
   score: number;
+  /** 0..100 — how close this call sits to a decision boundary */
+  uncertainty: number;
+  /** 0..1 — how much independent measured evidence stood behind the call */
+  evidenceStrength: number;
+  /** confidence sits inside the 40–60% band */
+  uncertainBand: boolean;
+  /** why the run is inconclusive; null when the call is firm */
+  inconclusiveReason: string | null;
   explanation: string[];
+}
+
+export interface ImageAnalysis extends VerdictBlock {
+  kind: "image";
   checks: Check[];
   faces: FaceResult[];
   metadata: MetadataFindings | null;
   engine: EngineInfo;
+  /** per-detector evidence breakdown (optional for legacy stored rows) */
+  evidence?: EvidenceReport;
   warnings: string[];
   processingTimeMs: number;
   dimensions: { width: number; height: number };
@@ -186,12 +278,8 @@ export interface AudioProfile {
   note: string;
 }
 
-export interface VideoAnalysis {
+export interface VideoAnalysis extends VerdictBlock {
   kind: "video";
-  verdict: Verdict;
-  confidence: number;
-  score: number;
-  explanation: string[];
   checks: Check[];
   faces: FaceResult[];
   timeline: TimelinePoint[];
@@ -201,6 +289,8 @@ export interface VideoAnalysis {
   audio: AudioProfile | null;
   metadata: MetadataFindings | null;
   engine: EngineInfo;
+  /** per-detector evidence breakdown (optional for legacy stored rows) */
+  evidence?: EvidenceReport;
   warnings: string[];
   processingTimeMs: number;
   durationSec: number;

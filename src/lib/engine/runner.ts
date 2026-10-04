@@ -21,6 +21,11 @@ import { mean, median, ramp } from "./dsp";
 import { BANDS } from "./forensics";
 import { decideVerdict } from "./verdict";
 import {
+  defaultDetectors,
+  mergeEvidence,
+  type DetectorContext,
+} from "./detectors";
+import {
   analyzeTemporal,
   buildTimeline,
   combineVideo,
@@ -34,14 +39,12 @@ import type {
   AnalysisSettings,
   EngineInfo,
   FaceResult,
-  FrameResult,
   ImageAnalysis,
   MetadataFindings,
   StageProgress,
   SuspiciousFrame,
   TemporalStats,
   VideoAnalysis,
-  Verdict,
 } from "./types";
 
 export class AnalysisError extends Error {
@@ -268,6 +271,30 @@ export async function runImage(
     }
   }
 
+  /* --- detector portfolio + evidence fusion ----------------------- */
+  emit({ stage: "forensics", pct: 78, note: "Running independent detectors" });
+  const engineInfoValue = engineInfo(
+    faceStatus,
+    faceDetail,
+    checks.filter((c) => c.weight > 0).map((c) => c.id),
+  );
+  const detectorCtx: DetectorContext = {
+    kind: "image",
+    format,
+    sensitivity: settings.sensitivity,
+    checks,
+    signal: sig,
+    faces,
+    faceScore,
+    metadata,
+    temporal: null,
+    audio: null,
+    engine: engineInfoValue,
+  };
+  const fusion = await mergeEvidence(defaultDetectors(), detectorCtx, (note, pct) =>
+    emit({ stage: "forensics", pct: 78 + Math.round(pct * 0.06), note }),
+  );
+
   emit({ stage: "report", pct: 86, note: "Composing verdict" });
   const decision = decideVerdict({
     checks,
@@ -275,19 +302,26 @@ export async function runImage(
     kind: "image",
     sensitivity: settings.sensitivity,
     evidence: evidenceQuality(sig.sharpness, metadata),
+    evidenceStrength: fusion.evidenceStrength,
   });
   const score = decision.score;
 
   const analysis: ImageAnalysis = {
     kind: "image",
     verdict: decision.verdict,
+    outcome: decision.outcome,
     confidence: decision.confidence,
     score,
+    uncertainty: decision.uncertainty,
+    evidenceStrength: decision.evidenceStrength,
+    uncertainBand: decision.uncertainBand,
+    inconclusiveReason: decision.inconclusiveReason,
     explanation: decision.explanation,
     checks,
     faces,
     metadata,
-    engine: engineInfo(faceStatus, faceDetail, checks.filter((c) => c.weight > 0).map((c) => c.id)),
+    engine: engineInfoValue,
+    evidence: fusion,
     warnings,
     processingTimeMs: Math.round(performance.now() - t0),
     dimensions: { width: origW, height: origH },
@@ -512,7 +546,7 @@ export async function runVideo(
     }
     try {
       await seekTo(video, Math.min(times[i], Math.max(0, duration - 0.05)));
-    } catch (err) {
+    } catch {
       warnings.push(`Frame ${i} at ${times[i].toFixed(1)}s could not be decoded and was skipped.`);
       frameInputs.push({
         t: times[i],
@@ -599,7 +633,11 @@ export async function runVideo(
   const { stats: temporal, frameResults } = analyzeTemporal(frameInputs, faceJitter);
   const timeline = buildTimeline(frameResults, duration);
   const hasFaces = frameInputs.some((f) => f.faces > 0);
-  const score = combineVideo(frameResults, temporal, hasFaces);
+  // The frame/temporal combination is still computed as the per-frame lean that
+  // feeds the timeline; the final score itself comes from the decision core over
+  // the measured checks, not from this scalar.
+  const frameLeanCombined = combineVideo(frameResults, temporal, hasFaces);
+  void frameLeanCombined;
   await tick();
 
   /* --- most suspicious frame → face breakdown ----------------------- */
@@ -731,19 +769,50 @@ export async function runVideo(
   }
   checks.push(...audioChecks);
 
+  /* --- detector portfolio + evidence fusion ----------------------- */
+  emit({ stage: "temporal", pct: 88, note: "Running independent detectors" });
+  const engineInfoValue = engineInfo(
+    faceStatus,
+    faceDetail,
+    checks.filter((c) => c.weight > 0).map((c) => c.id),
+  );
+  const fusion = await mergeEvidence(
+    defaultDetectors(),
+    {
+      kind: "video",
+      format,
+      sensitivity: settings.sensitivity,
+      checks,
+      signal: null,
+      faces,
+      faceScore,
+      metadata,
+      temporal,
+      audio,
+      engine: engineInfoValue,
+    },
+    (note, pct) => emit({ stage: "temporal", pct: 88 + Math.round(pct * 0.03), note }),
+  );
+
   const decision = decideVerdict({
     checks,
     faceScore,
     kind: "video",
     sensitivity: settings.sensitivity,
+    evidenceStrength: fusion.evidenceStrength,
   });
   const finalScore = decision.score;
 
   const analysis: VideoAnalysis = {
     kind: "video",
     verdict: decision.verdict,
+    outcome: decision.outcome,
     confidence: decision.confidence,
     score: finalScore,
+    uncertainty: decision.uncertainty,
+    evidenceStrength: decision.evidenceStrength,
+    uncertainBand: decision.uncertainBand,
+    inconclusiveReason: decision.inconclusiveReason,
     explanation: decision.explanation,
     checks,
     faces,
@@ -753,7 +822,8 @@ export async function runVideo(
     temporal,
     audio,
     metadata,
-    engine: engineInfo(faceStatus, faceDetail, checks.filter((c) => c.weight > 0).map((c) => c.id)),
+    engine: engineInfoValue,
+    evidence: fusion,
     warnings,
     processingTimeMs: Math.round(performance.now() - t0),
     durationSec: duration,

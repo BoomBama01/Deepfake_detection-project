@@ -4,7 +4,6 @@ import { useMutation, useQuery } from "convex/react";
 import { toast } from "sonner";
 import {
   ArrowLeft,
-  Download,
   FileJson2,
   Loader2,
   Pin,
@@ -19,11 +18,7 @@ import { api } from "@/convex/_generated/api";
 import type { Id } from "@/convex/_generated/dataModel";
 import { Navbar } from "@/components/site/Navbar";
 import { Footer } from "@/components/site/Footer";
-import { ConfidenceGauge } from "@/components/ConfidenceGauge";
-import { Disclaimer } from "@/components/Disclaimer";
-import { VerdictBadge } from "@/components/VerdictBadge";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -50,14 +45,12 @@ import {
 } from "@/components/results/parts";
 import { getDeviceId } from "@/lib/device";
 import { recallFile } from "@/lib/session";
-import type { Analysis, ImageAnalysis, VideoAnalysis } from "@/lib/engine/types";
+import type { Analysis, VideoAnalysis } from "@/lib/engine/types";
 import { THRESHOLDS } from "@/lib/engine/verdict";
-import { formatBytes, formatDate, formatDuration } from "@/lib/format";
+import { ForensicReportView } from "@/components/results/Report";
+import { buildReport } from "@/lib/engine/report";
+import { formatDate, formatDuration } from "@/lib/format";
 
-type ScanRow = NonNullable<ReturnType<typeof scanQueryShape>>;
-function scanQueryShape() {
-  return null as unknown as never;
-}
 type ResultsQuery = ReturnType<typeof useQuery<typeof api.scans.get>>;
 type Scan = Exclude<ResultsQuery, undefined | null>;
 
@@ -86,7 +79,6 @@ export default function Results() {
   const [fbBusy, setFbBusy] = useState(false);
   const [comment, setComment] = useState("");
   const videoRef = useRef<HTMLVideoElement>(null);
-  const [videoUrl, setVideoUrl] = useState<string | null>(null);
 
   const analysis = useMemo<Analysis | null>(() => {
     if (!scan?.resultJson) return null;
@@ -97,17 +89,20 @@ export default function Results() {
     }
   }, [scan]);
 
-  useEffect(() => {
-    if (analysis?.kind !== "video") return;
+  /* The original video is never uploaded, so it can only be replayed while it is
+     still in this tab's in-memory registry. The object URL is derived (not
+     stored in state) and the effect exists solely to revoke it, which avoids
+     the setState-in-effect cascade. */
+  const videoUrl = useMemo(() => {
+    if (analysis?.kind !== "video") return null;
     const file = recallFile(id);
-    if (file) {
-      const url = URL.createObjectURL(file);
-      setVideoUrl(url);
-      return () => URL.revokeObjectURL(url);
-    }
-    setVideoUrl(null);
-    return;
+    return file ? URL.createObjectURL(file) : null;
   }, [analysis, id]);
+
+  useEffect(() => {
+    if (!videoUrl) return;
+    return () => URL.revokeObjectURL(videoUrl);
+  }, [videoUrl]);
 
   if (!valid || scan === undefined) {
     return (
@@ -158,19 +153,18 @@ export default function Results() {
   const th = THRESHOLDS[sensitivity] ?? THRESHOLDS.balanced;
   const isVideo = analysis.kind === "video";
   const video = isVideo ? (analysis as VideoAnalysis) : null;
-  const image = !isVideo ? (analysis as ImageAnalysis) : null;
   const shareUrl = `${window.location.origin}/results/${id}`;
 
+  /** Downloads the forensic report — the same document the page renders. */
   const downloadJson = () => {
     const payload = {
       scanId: id,
       fileName: scan.fileName,
-      verdict: scan.verdict,
-      confidence: scan.confidence,
+      source: scan.source,
       settings: scan.settings,
       createdAt: new Date(scan.createdAt).toISOString(),
-      engine: analysis.engine,
-      result: analysis,
+      expiresAt: new Date(scan.expiresAt).toISOString(),
+      report: buildReport(analysis),
     };
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
@@ -209,15 +203,14 @@ export default function Results() {
     }
   };
 
-  const storedVerdict = scan.verdict ?? "inconclusive";
-  /* legacy rows may hold "inconclusive" from the old three-way engine —
-     the product is binary now, so display them on the side of their score */
-  const verdict =
-    storedVerdict === "inconclusive"
-      ? analysis.score >= 0.5
-        ? ("likely_ai" as const)
-        : ("real" as const)
-      : storedVerdict;
+  /* The engine reports three outcomes. Legacy rows stored before the
+     three-way engine carry no `outcome` field; `resolveOutcomeLabel` (used by
+     ForensicReportView) falls back from the verdict, so a legacy row is never
+     silently upgraded to a confident call. */
+  /* Legacy rows stored before the three-way engine carry no `outcome` field;
+     `resolveOutcomeLabel` (used by ForensicReportView) falls back from the
+     verdict, so an old row is never silently upgraded to a confident call. */
+  const verdict = scan.verdict ?? analysis.verdict;
   const title = isVideo ? "Video examination" : "Image examination";
 
   return (
@@ -238,79 +231,14 @@ export default function Results() {
           </p>
         </div>
 
-        {/* verdict card */}
-        <section className="paper-grain mt-4 rounded-xl border-2 border-border bg-card p-6 sm:p-8">
-          <div className="grid gap-8 lg:grid-cols-[1.4fr_1fr]">
-            <div>
-              <div className="flex flex-wrap items-center gap-4">
-                <VerdictBadge verdict={verdict} large />
-                {(analysis.confidence <= 60 || storedVerdict === "inconclusive") &&
-                verdict !== "error" ? (
-                  <span
-                    role="status"
-                    className="rounded border border-[var(--verdict-uncertain)]/60 bg-[var(--verdict-uncertain)]/10 px-2 py-1 font-mono text-[10px] uppercase tracking-[0.18em] text-[var(--verdict-uncertain)]"
-                  >
-                    Low confidence — a lean, not a firm call
-                  </span>
-                ) : null}
-                <div className="font-mono text-xs text-muted-foreground">
-                  score {analysis.score.toFixed(3)} · sensitivity {sensitivity}
-                </div>
-              </div>
-              <h1 className="mt-5 font-display text-2xl font-semibold leading-snug sm:text-3xl">
-                {title}: {scan.fileName}
-              </h1>
-              <ol className="mt-4 space-y-3">
-                {analysis.explanation.map((line, i) => (
-                  <li
-                    key={i}
-                    className="flex gap-3 font-body text-sm leading-6 text-foreground/85"
-                  >
-                    <span className="mt-0.5 font-mono text-[10px] text-muted-foreground">
-                      {String(i + 1).padStart(2, "0")}
-                    </span>
-                    {line}
-                  </li>
-                ))}
-              </ol>
-              {analysis.warnings.length > 0 && (
-                <div className="mt-4 rounded-md border border-[var(--verdict-uncertain)]/40 bg-[var(--verdict-uncertain)]/5 p-3">
-                  <WarningList warnings={analysis.warnings} />
-                </div>
-              )}
-              <div className="mt-5">
-                <Disclaimer />
-              </div>
-            </div>
-
-            <div className="flex flex-col items-center gap-5">
-              <ConfidenceGauge value={analysis.confidence} verdict={verdict} />
-              <dl className="grid w-full grid-cols-2 gap-x-4 gap-y-2 border-t border-border/70 pt-4 font-mono text-[11px]">
-                <Meta k="file" v={formatBytes(scan.fileSize)} />
-                <Meta
-                  k={isVideo ? "duration" : "dimensions"}
-                  v={
-                    isVideo && video
-                      ? formatDuration(video.durationSec)
-                      : `${analysis.dimensions.width}×${analysis.dimensions.height}`
-                  }
-                />
-                <Meta
-                  k="faces"
-                  v={String(analysis.faces.length)}
-                />
-                <Meta k="engine time" v={`${analysis.processingTimeMs} ms`} />
-                {isVideo && video && (
-                  <>
-                    <Meta k="frames" v={String(video.frameCount)} />
-                    <Meta k="sampled at" v={`${settings?.frameRate ?? 2} fps`} />
-                  </>
-                )}
-                <Meta k="expires" v={new Date(scan.expiresAt).toLocaleDateString()} />
-                <Meta k="source" v={scan.source} />
-              </dl>
-            </div>
-          </div>
+        {/* the forensic report: verdict, confidence, uncertainty, evidence, reasoning */}
+        <section className="mt-4">
+          <ForensicReportView
+            analysis={analysis}
+            caseId={id.slice(0, 10)}
+            fileName={scan.fileName}
+            title={title}
+          />
         </section>
 
         {/* actions */}

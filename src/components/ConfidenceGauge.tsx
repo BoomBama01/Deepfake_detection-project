@@ -29,13 +29,15 @@ export function ConfidenceGauge({
   const bandEnd = polar(cx, cy, r, -220 + 0.6 * 260);
   const bandArc = `M ${bandStart.x} ${bandStart.y} A ${r} ${r} 0 0 1 ${bandEnd.x} ${bandEnd.y}`;
   const inBand = clamped >= 40 && clamped <= 60;
+  /* INCONCLUSIVE gets the uncertainty colour, not the authentic or fake one:
+     a result that does not settle the question must not be tinted either way. */
   const color =
-    verdict === "real"
-      ? "var(--verdict-real)"
+    verdict === "error"
+      ? "var(--muted-foreground)"
       : verdict === "inconclusive"
         ? "var(--verdict-uncertain)"
-        : verdict === "error"
-          ? "var(--muted-foreground)"
+        : verdict === "real"
+          ? "var(--verdict-real)"
           : "var(--verdict-fake)";
 
   return (
@@ -94,7 +96,13 @@ export function ConfidenceGauge({
             inBand ? "text-[var(--verdict-uncertain)]" : "text-muted-foreground"
           }`}
         >
-          {inBand ? "uncertain band 40–60%" : "confidence"}
+          {verdict === "inconclusive"
+            ? "evidence did not settle it"
+            : verdict === "error"
+              ? "no result"
+              : inBand
+                ? "uncertain band 40–60%"
+                : "confidence"}
         </div>
       </div>
     </div>

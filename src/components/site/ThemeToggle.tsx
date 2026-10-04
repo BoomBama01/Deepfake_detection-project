@@ -1,15 +1,13 @@
 import { Moon, Sun } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { setThemePreference, themePreference } from "@/lib/device";
 
 /** Light/dark toggle for the vintage palette (paper / night archive). */
 export function ThemeToggle() {
-  const [mode, setMode] = useState<"light" | "dark">("light");
-
-  useEffect(() => {
-    setMode(themePreference());
-  }, []);
+  /* Read the stored preference once via a lazy initializer instead of setting
+     state in an effect — same first paint, no cascading render. */
+  const [mode, setMode] = useState<"light" | "dark">(() => themePreference());
 
   const toggle = () => {
     const next = mode === "light" ? "dark" : "light";

@@ -85,6 +85,9 @@ export function CompareSlider({
 /* Checks list                                                         */
 /* ------------------------------------------------------------------ */
 
+/** Timeline chart padding. Module-level so it is stable across renders. */
+const PAD = { l: 34, r: 8, t: 10, b: 22 };
+
 const STATUS_TONE: Record<Check["status"], string> = {
   ok: "border-[var(--verdict-real)]/50 bg-[var(--verdict-real)]/10 text-[var(--verdict-real)]",
   warn: "border-[var(--verdict-uncertain)]/60 bg-[var(--verdict-uncertain)]/10 text-[var(--verdict-uncertain)]",
@@ -242,7 +245,6 @@ export function TimelineChart({
 }) {
   const W = 640;
   const H = 150;
-  const PAD = { l: 34, r: 8, t: 10, b: 22 };
 
   const path = useMemo(() => {
     if (!timeline.length) return "";

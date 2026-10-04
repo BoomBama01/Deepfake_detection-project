@@ -33,8 +33,8 @@ const PIPELINE = [
   },
   {
     step: "06",
-    title: "Decide, honestly",
-    body: "Thresholds separate real from fake — every score resolves to a binary call, Real or AI. A check that actively fired can never be averaged away into ‘Real’: any flagged measurement floors the score onto the AI side of the decision midpoint, and decisive face evidence floors it at Likely deepfake. When the file itself is washed out (heavy recompression, blur, resampling) the call still leans to the side of its measurement, but confidence is capped at 50% and marked low-confidence — the number never reads as proof.",
+    title: "Decide, honestly — three ways",
+    body: "The outcome is one of three: LIKELY AUTHENTIC, LIKELY AI-GENERATED or MANIPULATED, or INCONCLUSIVE. A check that actively fired can never be averaged away into a pass — any flagged measurement floors the score onto the AI side of the decision midpoint, and decisive face evidence floors it at Likely deepfake. But when the file itself is washed out (heavy recompression, blur, resampling), when the detectors contradict each other, or when the score lands between the two thresholds, the answer is INCONCLUSIVE — reported as its own outcome rather than rounded to the nearer side.",
   },
 ];
 
@@ -46,8 +46,8 @@ const PRINCIPLES = [
   },
   {
     icon: Scale,
-    title: "Low confidence is a first-class signal",
-    body: "Most tools dress uncertainty up as certainty. We do not: every file gets a binary Real or AI verdict, and borderline evidence is reported with a low confidence score — capped at 50% and drawn inside the 40–60% uncertain band — instead of a falsely precise number. A confident answer to an unanswerable question is misinformation.",
+    title: "Inconclusive is a real answer",
+    body: "Most tools dress uncertainty up as certainty. We do not. When the evidence is weak, degraded, or the detectors disagree, TruthLens says INCONCLUSIVE and explains why — rather than picking whichever side was nearest. That is why the brief you are reading may not give you a verdict at all: a confident answer to an unanswerable question is misinformation.",
   },
   {
     icon: ShieldCheck,
@@ -111,7 +111,9 @@ export default function About() {
               ["Per-face checks", "Edge density, colour statistics and noise inside every detected face box."],
               ["Temporal analysis (video)", "Frame-to-frame flicker, lighting drift and landmark jitter — fakes struggle to stay stable."],
               ["Audio profile (video)", "Clipping, DC offset, silence runs and spectral shape. Honest limits: voice-clone classification is not in v1."],
-              ["Evidence quality gate", "Sharpness and compression level are measured first: a washed-out file can never be reported as a confident Real — its call is capped at 50% confidence and marked low-confidence."],
+              ["Evidence quality gate", "Sharpness and compression level are measured first. A washed-out file — heavily recompressed, blurred or resampled — returns INCONCLUSIVE, because finding no manipulation signals in it does not demonstrate authenticity."],
+              ["Detector disagreement", "When independent evidence families contradict each other, the run returns INCONCLUSIVE instead of resolving in favour of whichever side is louder."],
+              ["Uncertainty", "Every result carries a measured distance to the nearest decision boundary, shown alongside the confidence. A verdict sitting on a boundary cannot be presented as firm."],
             ].map(([name, body]) => (
               <div
                 key={name}

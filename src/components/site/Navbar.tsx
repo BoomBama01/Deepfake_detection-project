@@ -1,5 +1,5 @@
-import { ScanSearch, Menu, LogOut, LayoutDashboard, UserRound } from "lucide-react";
-import { useEffect, useState } from "react";
+import { ScanSearch, Menu, LogOut, LayoutDashboard, UserRound, FlaskConical } from "lucide-react";
+import { useState } from "react";
 import { Link, useLocation } from "react-router";
 import { Button } from "@/components/ui/button";
 import {
@@ -41,9 +41,15 @@ export function Navbar({ variant = "landing" }: { variant?: "landing" | "app" })
   const location = useLocation();
   const [open, setOpen] = useState(false);
 
-  useEffect(() => {
+  /* Close the account menu on navigation. Adjusting state during render (rather
+     than in an effect) avoids the extra cascading render and the flash of an
+     open menu on the destination page. */
+  const [lastPath, setLastPath] = useState(location.pathname + location.hash);
+  const currentPath = location.pathname + location.hash;
+  if (lastPath !== currentPath) {
+    setLastPath(currentPath);
     setOpen(false);
-  }, [location.pathname, location.hash]);
+  }
 
   return (
     <header className="sticky top-0 z-40 border-b border-border/80 glass-vintage">
@@ -122,6 +128,12 @@ export function Navbar({ variant = "landing" }: { variant?: "landing" | "app" })
                   <Link to="/dashboard?tab=account">
                     <UserRound className="mr-2 size-4" />
                     Account &amp; API keys
+                  </Link>
+                </DropdownMenuItem>
+                <DropdownMenuItem asChild className="cursor-pointer">
+                  <Link to="/developer">
+                    <FlaskConical className="mr-2 size-4" />
+                    Developer mode
                   </Link>
                 </DropdownMenuItem>
                 <DropdownMenuSeparator />

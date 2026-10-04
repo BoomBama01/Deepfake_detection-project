@@ -32,7 +32,6 @@ import {
   DEFAULT_SETTINGS,
   type FaceBox,
   type Sensitivity,
-  type Verdict,
 } from "../src/lib/engine/types";
 
 function argValue(flag: string): string | undefined {
@@ -152,6 +151,12 @@ interface Pair {
   precision: number;
   recall: number;
   f1: number;
+  /** false-positive rate: authentic media called synthetic */
+  fpr: number;
+  /** false-negative rate: synthetic media called authentic */
+  fnr: number;
+  /** share of samples the decision core declined to decide */
+  abstain: number;
 }
 
 function evaluate(real: number, fake: number): Pair {
@@ -160,6 +165,8 @@ function evaluate(real: number, fake: number): Pair {
     tn = 0;
   let calledFake = 0;
   let nFake = 0;
+  let nReal = 0;
+  let abstains = 0;
   for (const s of samples) {
     /* the *production* decision with this candidate threshold pair */
     const d = decideCore(
@@ -174,6 +181,8 @@ function evaluate(real: number, fake: number): Pair {
           ? "real"
           : "abstain";
     if (s.fake) nFake++;
+    else nReal++;
+    if (pred === "abstain") abstains++;
     if (pred === "fake") {
       calledFake++;
       if (s.fake) tp++;
@@ -184,7 +193,12 @@ function evaluate(real: number, fake: number): Pair {
   const recall = nFake > 0 ? tp / nFake : 0;
   const f1 = precision + recall > 0 ? (2 * precision * recall) / (precision + recall) : 0;
   const acc = (tp + tn) / samples.length;
-  return { real, fake, acc, precision, recall, f1 };
+  /* recall IS the true-positive rate, so its complement is the false-negative
+     rate: synthetic media the engine let through as authentic. */
+  const fnr = 1 - recall;
+  const fpr = nReal > 0 ? fp / nReal : 0;
+  const abstain = samples.length > 0 ? abstains / samples.length : 0;
+  return { real, fake, acc, precision, recall, f1, fpr, fnr, abstain };
 }
 
 const pairs: Pair[] = [];
@@ -193,14 +207,16 @@ for (let r = 0.2; r <= 0.5; r += 0.01) {
     pairs.push(evaluate(Number(r.toFixed(2)), Number(f.toFixed(2))));
   }
 }
-const byF1 = [...pairs].sort((a, b) => b.f1 - a.f1 || b.acc - a.acc);
+const byF1 = [...pairs].sort(
+  (a, b) => b.f1 - a.f1 || a.fnr - b.fnr || a.abstain - b.abstain || b.acc - a.acc,
+);
 const byAcc = [...pairs].sort((a, b) => b.acc - a.acc || b.f1 - a.f1);
 
 const cur = THRESHOLDS[sensitivity];
 const curEval = evaluate(cur.real, cur.fake);
 
 const fmt = (p: Pair) =>
-  `real ≤ ${p.real.toFixed(2)}, fake ≥ ${p.fake.toFixed(2)}  →  acc ${(100 * p.acc).toFixed(1)}%  P ${(100 * p.precision).toFixed(1)}%  R ${(100 * p.recall).toFixed(1)}%  F1 ${p.f1.toFixed(3)}`;
+  `real ≤ ${p.real.toFixed(2)}, fake ≥ ${p.fake.toFixed(2)}  →  acc ${(100 * p.acc).toFixed(1)}%  P ${(100 * p.precision).toFixed(1)}%  R ${(100 * p.recall).toFixed(1)}%  F1 ${p.f1.toFixed(3)}  FPR ${(100 * p.fpr).toFixed(1)}%  FNR ${(100 * p.fnr).toFixed(1)}%  abstain ${(100 * p.abstain).toFixed(1)}%`;
 
 console.log(`\nTruthLens threshold calibration (sensitivity: ${sensitivity})`);
 console.log(`  images: ${samples.length} (${samples.filter((s) => s.fake).length} fake / ${samples.filter((s) => !s.fake).length} real), failed: ${failed}`);

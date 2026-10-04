@@ -194,7 +194,9 @@ export default function Docs() {
                 <tr>
                   <td className="px-4 py-2 font-mono text-xs">real</td>
                   <td className="px-4 py-2 text-muted-foreground">
-                    Passed every forensic check — but still probabilistic.
+                    Likely authentic — the measurements sit inside the ranges
+                    expected from camera-sourced media and the evidence base was
+                    good enough to say so. Still probabilistic.
                   </td>
                 </tr>
                 <tr>
@@ -215,9 +217,12 @@ export default function Docs() {
                 <tr>
                   <td className="px-4 py-2 font-mono text-xs">inconclusive</td>
                   <td className="px-4 py-2 text-muted-foreground">
-                    Legacy records only (old three-way engine). New analyses
-                    are always binary — real, likely_ai or likely_deepfake —
-                    and express uncertainty as low confidence instead.
+                    The evidence does not settle the question: the score landed
+                    between the two thresholds, the file was degraded beyond
+                    usefulness, or the detectors contradicted each other. The
+                    response carries{" "}
+                    <span className="font-mono">inconclusiveReason</span>{" "}
+                    explaining which of those applied.
                   </td>
                 </tr>
                 <tr>

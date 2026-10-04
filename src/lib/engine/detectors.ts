@@ -1,99 +1,144 @@
 /**
- * TruthLens — modular detection-evidence fusion (Phase 3).
+ * TruthLens — modular detector architecture and evidence fusion.
  *
- * Every file is examined through a portfolio of *independent* detectors, each
- * of which reports one measured signal plus an honesty rating. The
- * evidence-fusion layer (`mergeEvidence`) combines those signals into a
- * single combined score and a per-evidence-category report. Nothing is
- * treated as definitive on the strength of a single detector.
+ * Every file is examined through a portfolio of *independent* detectors. Each
+ * detector reports one or more measured signals shaped as
  *
- * This file is the *abstraction* required by the product specification:
- * ImageAIDetector, FaceManipulationDetector, FrequencyDetector,
- * MetadataDetector, ProvenanceDetector, VideoTemporalDetector and
- * AudioVideoSyncDetector all implement the same `Detector` interface, so a
- * different classifier or model can be plugged in later without touching the
- * verdict or UI layers.
+ *     { id, label, group, raw, score, confidence, evidence, reliability }
+ *
+ * and the fusion layer (`mergeEvidence`) combines them into a combined score
+ * plus a per-evidence-category report. No single detector is ever treated as
+ * definitive, and a detector that cannot run reports `reliability: "skip"` with
+ * weight 0 rather than an invented number.
+ *
+ * The portfolio is deliberately the abstraction the product requires:
+ *
+ *   Detector
+ *   ├── ImageAIDetector           (AI-generation classifier — pluggable)
+ *   ├── VisualArtifactDetector     (noise / histogram / seam artifacts)
+ *   ├── FrequencyDetector          (FFT power-spectrum)
+ *   ├── CompressionDetector        (JPEG grid + error-level analysis)
+ *   ├── MetadataDetector           (EXIF / encoder / generator signatures)
+ *   ├── ProvenanceDetector         (C2PA content credentials)
+ *   ├── FaceManipulationDetector   (per-face consistency)
+ *   ├── VideoTemporalDetector      (frame-to-frame consistency)
+ *   └── AudioVideoSyncDetector     (audio continuity profile)
+ *
+ * A different classifier or model can be plugged in without touching the
+ * verdict or UI layers — see `ClassifierBackend` / `registerBackend`.
  */
 
 import {
-  analyzeSignal,
+  BANDS,
+  PROVENANCE_MIN_QF,
   buildFaceAggregate,
-  evidenceQuality,
   type SignalAnalysis,
 } from "./forensics";
+import { clamp, mean, ramp, stdDev } from "./dsp";
+import type { MediaFormat } from "./metadata";
 import type {
+  AudioProfile,
+  Check,
+  CheckGroup,
+  EngineInfo,
   FaceResult,
   MetadataFindings,
-  StageProgress,
-} from "./types";
-import { parseMetadata, sniffFormat, type MediaFormat } from "./metadata";
-import { decideVerdict, type VerdictDecision } from "./verdict";
-import { combineVideo, type FrameInput } from "./video";
-import { analyzeAudio, makeAudioCheck } from "./audio";
-import type {
-  Analysis,
-  ImageAnalysis,
-  VideoAnalysis,
-  SuspiciousFrame,
-  TemporalStats as TemporalStatsType,
-  AudioProfile as AudioProfileType,
-  Check,
-  FaceResult as FaceResultType,
-  MetadataFindings as MetadataFindingsType,
+  Sensitivity,
+  TemporalStats,
 } from "./types";
 
+/* ==================================================================== */
+/* Signal + category shapes                                             */
+/* ==================================================================== */
 
-/** A single detector's measured contribution to the verdict. */
+/**
+ * Evidence families. `compression` and `spectral` are separated from `image`
+ * because a forensic report should be able to say *which* physical layer of
+ * the file carried the evidence.
+ */
+export type DetectorGroup =
+  | "image"
+  | "spectral"
+  | "compression"
+  | "metadata"
+  | "provenance"
+  | "face"
+  | "temporal"
+  | "audio";
+
+export const DETECTOR_GROUP_LABEL: Record<DetectorGroup, string> = {
+  image: "Visual artifacts",
+  spectral: "Frequency anomalies",
+  compression: "Compression & resampling",
+  metadata: "Metadata",
+  provenance: "Provenance",
+  face: "Face consistency",
+  temporal: "Temporal consistency",
+  audio: "Audio continuity",
+};
+
+/** How much we trust a single signal on its own. */
+export type SignalReliability = "skip" | "not-applicable" | "ok" | "warn" | "flag";
+
+/** A single detector's measured contribution to the report. */
 export interface DetectorSignal {
-  /** short id, used for the evidence report */
+  /** short stable id, used by the report and the developer dashboard */
   id: string;
   /** human label */
   label: string;
-  /** platform family (image | video | metadata | provenance | face | audio) */
-  group: "image" | "video" | "metadata" | "provenance" | "face" | "audio";
-  /** raw measured value as a string for the report */
+  /** which evidence family this signal belongs to */
+  group: DetectorGroup;
+  /** the measured value, already human-formatted */
   raw: string;
   /** 0..1 synthetic-leaning lean (1 = strongly synthetic/manipulated) */
   score: number;
-  /** 0..1 — how much this detector's output contributes to the combined score */
+  /** 0..1 fusion weight; 0 means "did not run" */
   weight: number;
-  /** measured confidence in this detector's own score (0..100) */
+  /** 0..100 measured confidence in *this* detector's score */
   confidence: number;
-  /** plain-English finding quoting the real numbers */
-  finding: string;
-  /** honesty rating: skip (cannot run) / not-applicable / ok / warn / flag */
-  reliability: "skip" | "not-applicable" | "ok" | "warn" | "flag";
+  /** plain-English evidence, quoting the real measured numbers */
+  evidence: string;
+  /** honesty rating: did it run, and did it fire? */
+  reliability: SignalReliability;
+  /** which detector produced it (populated by the fusion layer) */
+  detector?: string;
+  /** detector version (populated by the fusion layer) */
+  detectorVersion?: string;
 }
 
 /** Per-evidence-category summary for the forensic report. */
 export interface EvidenceCategory {
-  id: string;
+  id: DetectorGroup;
   label: string;
-  /** detected signals in this category (score > 0.5 = flagged) */
   signals: DetectorSignal[];
-  /** whether any strong flag fired in this category */
-  flag: boolean;
-  /** worst sub-signal score */
+  /** did any strong signal fire in this category? */
+  flagged: boolean;
+  /** strongest signal score in this category */
   maxScore: number;
+  /** 0..1 — how much this category contributed */
+  weight: number;
 }
 
-/** One concrete detector. Implement `run()` and `version()`. */
+/* ==================================================================== */
+/* Detector abstraction                                                 */
+/* ==================================================================== */
+
+/** One concrete detector. Implement `name`, `version`, `group` and `run()`. */
 export abstract class Detector {
-  /** immutable display name (e.g. "Image AI-generation detector") */
+  /** stable display name */
   abstract readonly name: string;
-  /** semantic version string */
+  /** semantic version of the detector logic */
   abstract readonly version: string;
-  /** platform family */
-  abstract readonly group: DetectorSignal["group"] | "spectral" | "temporal" | "audio-video-sync";
+  /** evidence family this detector reports into */
+  abstract readonly group: DetectorGroup;
 
   /**
-   * Run the detector on the current analysis context.
-   * `context` always contains the raw pixel/byte data and the already-run
-   * image checks, so a detector can only use what is genuinely available.
+   * Run the detector. A detector may only read what is genuinely available in
+   * `context`; anything it cannot measure must be reported as skipped.
    */
   abstract run(context: DetectorContext): Promise<DetectorSignal[]>;
 
-  /** Human-readable details for the technical tab. */
+  /** Human-readable line for the technical tab. */
   details(): string {
     return `${this.name} v${this.version}`;
   }
@@ -101,352 +146,381 @@ export abstract class Detector {
 
 /** Everything a detector is allowed to read. */
 export interface DetectorContext {
-  /** raw RGBA pixels of the decoded media */
-  rgba: Uint8ClampedArray | Uint8Array;
-  /** width/height of the pixel plane actually analysed */
-  width: number;
-  height: number;
-  /** decoded container format (jpeg/png/webp/gif/mp4/webm/avi/unknown) */
+  /** image or video */
+  kind: "image" | "video";
+  /** decoded container format */
   format: MediaFormat;
-  /** decoded metadata (EXIF, C2PA markers, AI signatures, quality estimate) */
-  metadata: MetadataFindingsType | null;
-  /** full signal-forensic checks run on the whole image/video plane */
+  /** settings this run used */
+  sensitivity: Sensitivity;
+  /** every measured check the forensics layer produced */
   checks: Check[];
-  /** per-face measurements when faces were analysed */
-  faces: FaceResultType[];
-  /** face-score fed to the verdict (null when no face voted) */
+  /** the raw signal analysis, when the forensics layer ran it */
+  signal: SignalAnalysis | null;
+  /** per-face measurements */
+  faces: FaceResult[];
+  /** area-weighted face lean fed to the verdict (null when no face voted) */
   faceScore: number | null;
-  /** engine metadata (BlazeFace status, "not-bundled" neural classifier) */
+  /** decoded metadata (EXIF, C2PA markers, generator signatures, QF estimate) */
+  metadata: MetadataFindings | null;
+  /** temporal statistics — video runs only */
+  temporal: TemporalStats | null;
+  /** audio profile — video runs only */
+  audio: AudioProfile | null;
+  /** engine metadata (BlazeFace status, bundled-model disclosure) */
   engine: EngineInfo;
-  /** temporal statistics, only for video threads */
-  temporal: TemporalStatsType | null;
-  /** whether any face voted in the combined face evidence */
-  facesDominant: boolean;
 }
 
-export interface EngineInfo {
-  name: string;
-  version: string;
-  faceDetector: { name: string; status: EngineInfoFaceStatus; detail?: string };
-  neuralClassifier: { status: string; detail: string };
-  checksRun: string[];
+/* ==================================================================== */
+/* Pluggable AI-generation classifier backend                          */
+/* ==================================================================== */
+
+/** Feature vector handed to a classifier backend. All values are measured. */
+export interface GenerationFeatures {
+  /** 1 when the flat-region noise floor is unnaturally low */
+  noiseSmoothness: number;
+  /** 1 when the radial power-spectrum slope sits outside the natural band */
+  spectralAnomaly: number;
+  /** 1 when a periodic upsampling peak dominates the spectrum */
+  upsamplingPeak: number;
+  /** 1 when the luminance histogram shows post-processing gaps */
+  toneGap: number;
+  /** 1 when block-grid alignment disagrees between regions */
+  gridMisalignment: number;
+  /** 1 when error energy concentrates in a small set of tiles */
+  elaLocalization: number;
+  /** 1 when a hard vertical seam crosses the frame */
+  seam: number;
+  /** area-weighted face lean, or null when no face was measured */
+  faceLean: number | null;
 }
 
-export type EngineInfoFaceStatus = "loaded" | "unavailable" | "not_required";
-
-/**
- * Combines a portfolio of `Detector` signals into one combined score and a
- * per-category evidence report. Weights are *documented* and can be changed
- * centrally without touching any detector implementation.
- */
-export interface FusionResult {
-  /** combined synthetic-leaning score 0..1 */
+export interface ClassifierPrediction {
+  /** 0..1 synthetic-leaning lean */
   score: number;
-  /** verdict + confidence + explanation from the existing decision core */
-  decision: VerdictDecision;
-  /** per-category evidence summary */
-  categories: EvidenceCategory[];
-  /** every detector signal that contributed */
-  signals: DetectorSignal[];
-  /** per-detector scores, useful for the developer dashboard */
-  perDetector: Array<{
-    detector: string;
-    group: DetectorSignal["group"] | "spectral" | "temporal" | "audio-video-sync";
-    score: number;
-    confidence: number;
-    reliability: DetectorSignal["reliability"];
-  }>;
+  /** 0..100 confidence in that score */
+  confidence: number;
+  /** short note surfaced in the report (e.g. which features dominated) */
+  note: string;
 }
 
 /**
- * Weights mirror the existing check weights so the fusion layer stays
- * numerically identical to the production engine while every signal carries
- * an explicit provenance and honesty rating.
+ * A classifier backend. The shipped default is a *measured-feature* blend, not
+ * a neural network — and it says so. Replacing it with a trained model means
+ * implementing this interface and calling `registerBackend`; nothing else in
+ * the pipeline changes.
  */
-export const FUSION_WEIGHTS = {
-  ai: 0.18,
-  face: 0.26,
+export interface ClassifierBackend {
+  readonly id: string;
+  readonly version: string;
+  /** false when no trained weights are behind the prediction */
+  readonly modelBacked: boolean;
+  predict(features: GenerationFeatures): ClassifierPrediction;
+}
+
+/**
+ * Feature weights for the shipped heuristic backend.
+ *
+ * These are *not* arbitrary: each feature is the normalised output of a
+ * calibrated band from `forensics.ts` (see BANDS), and the weights sum to 1 so
+ * the prediction stays inside [0,1]. `scripts/calibrate.ts` sweeps the
+ * resulting score against the labelled samples and reports ROC-AUC.
+ */
+export const HEURISTIC_FEATURE_WEIGHTS: Record<keyof GenerationFeatures, number> = {
+  noiseSmoothness: 0.22,
+  spectralAnomaly: 0.22,
+  upsamplingPeak: 0.08,
+  toneGap: 0.08,
+  gridMisalignment: 0.1,
+  elaLocalization: 0.16,
+  seam: 0.14,
+  faceLean: 0,
+};
+
+/**
+ * The shipped backend: a deterministic blend of calibrated measurements.
+ * It is labelled `modelBacked: false` everywhere it is shown, because no
+ * trained weights are involved.
+ */
+export const HEURISTIC_BACKEND: ClassifierBackend = {
+  id: "truthlens-feature-blend",
+  version: "1.1.0",
+  modelBacked: false,
+  predict(features) {
+    const parts: Array<[keyof GenerationFeatures, number]> = (
+      Object.keys(features) as Array<keyof GenerationFeatures>
+    )
+      .map((k) => [k, features[k]] as [keyof GenerationFeatures, number])
+      .filter(([, v]) => typeof v === "number");
+
+    const active = parts.filter(([k]) => HEURISTIC_FEATURE_WEIGHTS[k] > 0);
+    if (active.length === 0) {
+      return {
+        score: 0.5,
+        confidence: 0,
+        note: "No measurable feature was available, so no generation score was produced.",
+      };
+    }
+    const wsum = active.reduce((a, [k]) => a + HEURISTIC_FEATURE_WEIGHTS[k], 0);
+    const score = clamp(
+      active.reduce((a, [k, v]) => a + HEURISTIC_FEATURE_WEIGHTS[k] * clamp(v, 0, 1), 0) / wsum,
+      0,
+      1,
+    );
+    const agreement = 1 - clamp(stdDev(active.map(([, v]) => v)) * 2, 0, 1);
+    const ranked = [...active].sort((a, b) => {
+      const wa = HEURISTIC_FEATURE_WEIGHTS[a[0]] * a[1];
+      const wb = HEURISTIC_FEATURE_WEIGHTS[b[0]] * b[1];
+      return wb - wa;
+    });
+    const dominant = ranked.slice(0, 2).filter(([, v]) => v >= 0.4).map(([k]) => k);
+    const note =
+      dominant.length > 0
+        ? `Dominated by ${dominant.join(" and ")}; the remaining ${active.length - dominant.length} feature(s) stayed below the flag level.`
+        : `All ${active.length} features sit inside the range expected from camera-sourced media.`;
+    /* confidence: how far from neutral, tempered by feature agreement.
+       Capped at 90 — a measured-feature blend is not a trained model. */
+    const confidence = clamp(
+      100 * (0.35 * Math.abs(score - 0.5) * 2 + 0.45 * agreement + 0.2),
+      5,
+      90,
+    );
+    void wsum;
+    return { score, confidence: Math.round(confidence), note };
+  },
+};
+
+let activeBackend: ClassifierBackend = HEURISTIC_BACKEND;
+
+/** Swap the AI-generation classifier for a trained model or another backend. */
+export function registerBackend(backend: ClassifierBackend): void {
+  activeBackend = backend;
+}
+
+export function currentBackend(): ClassifierBackend {
+  return activeBackend;
+}
+
+/* ==================================================================== */
+/* Fusion weights                                                       */
+/* ==================================================================== */
+
+/**
+ * Per-group fusion weights. These mirror the check weights already used by
+ * `forensics.ts` so the evidence report and the verdict describe the same
+ * measurement; changing them here changes only the report breakdown, never the
+ * score the verdict layer computes from `checks`.
+ */
+export const FUSION_WEIGHTS: Record<DetectorGroup, number> = {
+  image: 0.3,
   spectral: 0.18,
-  compression: 0.16,
+  compression: 0.26,
   metadata: 0.16,
   provenance: 0.08,
+  face: 0.26,
   temporal: 0.28,
   audio: 0.06,
-} as const;
+};
 
-/**
- * Merge one detector's signals with the existing whole-image checks.
- *
- * The existing `forensics.ts` + `verdict.ts` decision core is *still* the
- * source of truth for the verdict: detectors never re-derive a verdict by
- * themselves, they only populate the evidence report and (for video/audio)
- * append their check to the verdict's check list.
- */
-export async function mergeEvidence(
-  detectors: Detector[],
-  context: DetectorContext,
-  settings: { sensitivity: string },
-  emit: (s: { stage: string; pct: number; note?: string }) => void,
-  /** Optional per-detector dependency: the VideoTemporalDetector runs only
-   * when it can use the already-computed per-frame inputs. */
-  deps: Record<string, unknown> = {},
-): Promise<FusionResult> {
-  const signals: (DetectorSignal & { group: DetectorSignal["group"] | "spectral" | "temporal" | "audio-video-sync" })[] = [];
-  const categories: EvidenceCategory[] = [];
-  const perDetector: FusionResult["perDetector"] = [];
+/* ==================================================================== */
+/* Helpers                                                              */
+/* ==================================================================== */
 
-  for (const d of detectors) {
-    emit({
-      stage: "analyzing signals",
-      pct: Math.round((detectorIndex(detectors, d) / detectors.length) * 40) + 5,
-      note: `${d.name} v${d.version}`,
-    });
-    const ds = await d.run(context);
-    signals.push(...ds);
-    for (const s of ds) {
-      perDetector.push({
-        detector: d.name,
-        group: d.group,
-        score: s.score,
-        confidence: s.confidence,
-        reliability: s.reliability,
-      });
-    }
+/** Map an engine check group onto a detector evidence family. */
+export function groupForCheckGroup(group: CheckGroup): DetectorGroup {
+  switch (group) {
+    case "signal":
+      return "image";
+    case "spectral":
+      return "spectral";
+    case "compression":
+      return "compression";
+    case "metadata":
+      return "metadata";
+    case "face":
+      return "face";
+    case "temporal":
+      return "temporal";
+    case "audio":
+      return "audio";
   }
+}
 
-  /* ---------- evidence categories ---------- */
-  const categoryMap = new Map<string, EvidenceCategory>();
-  const idToCat = (id: string): EvidenceCategory => {
-    let c = categoryMap.get(id);
-    if (!c) {
-      c = { id, label: id.replace(/_/g, " "), signals: [], flag: false, maxScore: 0 };
-      categoryMap.set(id, c);
-      categories.push(c);
-    }
-    return c;
+/** A signal that reports "this detector could not measure anything". */
+function skipped(
+  id: string,
+  label: string,
+  group: DetectorGroup,
+  why: string,
+): DetectorSignal {
+  return {
+    id,
+    label,
+    group,
+    raw: "not run",
+    score: 0.5,
+    weight: 0,
+    confidence: 0,
+    evidence: why,
+    reliability: "skip",
   };
-
-  for (const s of signals) {
-    const c = idToCat(s.group);
-    c.signals.push(s);
-    c.maxScore = Math.max(c.maxScore, s.score);
-    if (s.reliability === "flag" && s.score >= 0.65) c.flag = true;
-  }
-
-  /* ---------- combined score ---------- */
-  // A detector that could not run contributes nothing; a "skip" contributes
-  // a neutral 0.5 but is never allowed to shift the verdict of its own
-  // right. The existing decision core in verdict.ts does the actual
-  // thresholding, flag veto and low-confidence capping.
-  const wsum = signals.reduce((a, s) => a + (s.weight > 0 ? s.weight : 0), 0) || 1;
-  const combined = signals.reduce((a, s) => a + s.score * (s.weight > 0 ? s.weight : 0), 0) / wsum;
-
-  /* extend the context's checks with detector-derived checks (video/audio) */
-  const constChecks = [...context.checks];
-  for (const s of signals) {
-    const s2 = s as DetectorSignal & {
-      group: DetectorSignal["group"] | "spectral" | "temporal" | "audio-video-sync";
-    };
-    if (s2.group === "temporal" || s2.group === "audio") {
-      constChecks.push({
-        id: s2.id,
-        label: s2.label,
-        group: s2.group,
-        raw: s2.raw,
-        display: s2.raw,
-        score: s2.score,
-        weight: s2.weight,
-        status: s2.reliability,
-        finding: s2.finding,
-      } as unknown as Check);
-    }
-  }
-
-  const decision = decideVerdict({
-    checks: constChecks,
-    faceScore: context.faceScore,
-    kind: context.format === "mp4" || context.format === "webm" ? "video" : "image",
-    sensitivity: settings.sensitivity as "low" | "balanced" | "high",
-    evidence: context.metadata
-      ? evidenceQuality(0, context.metadata)
-      : { degraded: false, reasons: [] },
-  });
-
-  return { score: decision.score, decision, categories, signals, perDetector };
 }
 
-function detectorIndex(arr: Detector[], d: Detector): number {
-  return arr.indexOf(d);
+/** A signal that ran and produced a usable measurement. */
+function measured(args: {
+  id: string;
+  label: string;
+  group: DetectorGroup;
+  raw: string;
+  score: number;
+  weight: number;
+  confidence: number;
+  evidence: string;
+}): DetectorSignal {
+  const score = clamp(args.score, 0, 1);
+  return {
+    ...args,
+    score,
+    reliability: score >= 0.65 ? "flag" : score >= 0.4 ? "warn" : "ok",
+  };
 }
-
-/** Aggregate detector-level evidence into the single `face` check the
- * verdict layers expect, keeping the engine's face aggregation numerically
- * identical to `buildFaceAggregate` + `analyzeFace`.
- */
-export function buildFaceEvidence(faces: FaceResultType[]): {
-  faceScore: number | null;
-  /** the `face` check that verdict.ts consumes */
-  faceCheck: Check | null;
-  dominant: boolean;
-} {
-  const aggregated = buildFaceAggregate(faces);
-  const faceCheck: Check | null = aggregated.check ?? null;
-  return { faceScore: aggregated.faceScore, faceCheck, dominant: aggregated.dominant };
-}
-
-/* ================================================================== */
-/* Concrete detectors (all implementing the same interface)            */
-/* ================================================================== */
 
 /**
- * ImageAIDetector — visual-texture + generative-artifact model.
+ * Turn the raw measurements into the normalised feature vector the classifier
+ * backend consumes. Each feature is a ramp over the *same* calibrated band the
+ * corresponding check uses, so a feature of 1 means "at or past the flag
+ * level", not "arbitrarily large".
+ */
+export function generationFeatures(ctx: DetectorContext): GenerationFeatures {
+  const sig = ctx.signal;
+  const check = (id: string) => ctx.checks.find((c) => c.id === id);
+  return {
+    noiseSmoothness: sig
+      ? 1 - ramp(sig.noise.sigmaFlat, BANDS.noiseSmooth.lo, BANDS.noiseSmooth.hi)
+      : (check("noise")?.score ?? 0),
+    spectralAnomaly: sig
+      ? clamp(
+          Math.max(
+            ramp(-sig.spectrum.slope, BANDS.spectralSlope.steep, BANDS.spectralSlope.steep + 1.1),
+            ramp(BANDS.spectralSlope.shallow + sig.spectrum.slope, 0, 0.7),
+          ),
+          0,
+          1,
+        )
+      : (check("spectrum")?.score ?? 0),
+    upsamplingPeak: sig
+      ? ramp(sig.spectrum.peak, BANDS.spectralPeak.lo, BANDS.spectralPeak.hi)
+      : 0,
+    toneGap: sig
+      ? clamp(
+          0.7 * ramp(sig.histogram.gaps, BANDS.histGaps.lo, BANDS.histGaps.hi) +
+            0.3 * ramp(sig.histogram.longestRun, BANDS.histRun.lo, BANDS.histRun.hi),
+          0,
+          1,
+        )
+      : (check("histogram")?.score ?? 0),
+    gridMisalignment: sig?.grid
+      ? 1 - ramp(sig.grid.phase, BANDS.gridPhase.lo, BANDS.gridPhase.hi)
+      : 0,
+    elaLocalization: check("ela")?.score ?? 0,
+    seam: check("seam")?.score ?? 0,
+    faceLean: ctx.faceScore,
+  };
+}
+
+/* ==================================================================== */
+/* Concrete detectors                                                   */
+/* ==================================================================== */
+
+/**
+ * ImageAIDetector — the AI-generation classifier.
  *
- * Runs on a *downscaled* reference face from a localized face region plus
- * the whole frame. The engine's neural classifier stays "not-bundled":
- * this detector encodes *feature-differences* (skin noise, spectral
- * tilt, block-grid, ELA) into the same 0..1 signal space as the
- * hand-crafted checks so a pluggable classifier can be added later.
+ * Delegates to the registered `ClassifierBackend` so a trained model can be
+ * added later without touching this file's callers. The shipped backend is a
+ * measured-feature blend and is reported as `modelBacked: false`.
  */
 export class ImageAIDetector extends Detector {
-  readonly name = "Image AI-generation detector";
-  readonly version = "1.0.0";
-  readonly group = "image";
+  readonly name = "AI-generation classifier";
+  readonly version = "1.1.0";
+  readonly group: DetectorGroup = "image";
 
   async run(ctx: DetectorContext): Promise<DetectorSignal[]> {
-    const signals: DetectorSignal[] = [];
+    const backend = currentBackend();
+    const features = generationFeatures(ctx);
+    const pred = backend.predict(features);
+    const detail = (Object.keys(features) as Array<keyof GenerationFeatures>)
+      .filter((k) => HEURISTIC_FEATURE_WEIGHTS[k] > 0)
+      .map((k) => `${k}=${((features[k] ?? 0) * 100).toFixed(0)}%`)
+      .join(", ");
 
-    /* --- whole-frame / face feature-render (no model claim) --- */
-    /* The existing checks already produce the measured evidence; this
-     * detector simply re-exports the relevant three as its own signals so
-     * the report can say where each number came from. */
-    const faceSigma = ctx.checks.find((c) => c.id === "face-noise");
-    const spectrum = ctx.checks.find((c) => c.id === "spectrum");
-    const ela = ctx.checks.find((c) => c.id === "ela");
-
-    if (faceSigma) {
-      signals.push({
-        id: "img-ai-face-noise",
-        label: "Face noise floor vs frame",
-        group: "image",
-        raw: faceSigma.display,
-        score: faceSigma.score,
-        weight: FUSION_WEIGHTS.ai,
-        confidence: 85,
-        finding: faceSigma.finding,
-        reliability: faceSigma.status,
-      });
-    }
-    if (spectrum) {
-      signals.push({
-        id: "img-ai-spectrum",
-        label: "Frequency spectrum tilt",
-        group: "image",
-        raw: spectrum.display,
-        score: spectrum.score,
-        weight: FUSION_WEIGHTS.spectral,
-        confidence: 80,
-        finding: spectrum.finding,
-        reliability: spectrum.status,
-      });
-    }
-    if (ela) {
-      signals.push({
-        id: "img-ai-ela",
-        label: "Error-Level analysis concentration",
-        group: "image",
-        raw: ela.display,
-        score: ela.score,
-        weight: FUSION_WEIGHTS.compression,
-        confidence: 80,
-        finding: ela.finding,
-        reliability: ela.status,
-      });
+    if (pred.confidence === 0) {
+      return [
+        skipped(
+          "ai-generation",
+          "AI-generation classifier",
+          "image",
+          `Backend "${backend.id}" produced no usable prediction for this file — the score is not guessed. ${pred.note}`,
+        ),
+      ];
     }
 
-    /* --- neural-performance model (plug point, not bundled here) --- */
-    // A real model would go here. It returns an explicit status so the
-    // verdict layer never guesses when no model is available.
-    signals.push({
-      id: "img-ai-neural",
-      label: "Neural classifier (not-bundled)",
-      group: "image",
-      raw: "not-bundled",
-      score: 0.5,
-      weight: 0,
-      confidence: 0,
-      finding:
-        "No trained image-authenticity classifier is bundled with this deployment. The combined score comes from the hand-crafted, measured checks above, not from a black-box probability.",
-      reliability: "not-applicable",
-    });
-
-    return signals;
+    return [
+      measured({
+        id: "ai-generation",
+        label: "AI-generation classifier",
+        group: "image",
+        raw: `${(pred.score * 100).toFixed(0)}% lean`,
+        score: pred.score,
+        weight: FUSION_WEIGHTS.image,
+        confidence: pred.confidence,
+        evidence:
+          `Backend ${backend.id} v${backend.version} (` +
+          `${backend.modelBacked ? "trained model" : "measured-feature blend, no trained weights"}` +
+          `) scored ${(pred.score * 100).toFixed(0)}% synthetic lean at ${pred.confidence}% confidence. ` +
+          `${pred.note} Features: ${detail}.`,
+      }),
+    ];
   }
 }
 
 /**
- * FaceManipulationDetector — per-face manipulation signals.
+ * VisualArtifactDetector — whole-frame physical artifacts.
  *
- * Reuses `analyzeFace`/`buildFaceAggregate` from `forensics.ts` so the
- * same measured evidence (skin noise, ELA boundary ring, compression
- * history, detail spectrum, edge density) feeds the report with its
- * honesty rating intact.
+ * Re-exports the noise-residual and histogram measurements as their own
+ * evidence family. It reports what ran; it never re-derives a score.
  */
-export class FaceManipulationDetector extends Detector {
-  readonly name = "Face manipulation detector";
+export class VisualArtifactDetector extends Detector {
+  readonly name = "Visual artifact detector";
   readonly version = "1.0.0";
-  readonly group = "face";
+  readonly group: DetectorGroup = "image";
 
   async run(ctx: DetectorContext): Promise<DetectorSignal[]> {
-    const signals: DetectorSignal[] = [];
-    if (!ctx.faces.length) {
-      signals.push({
-        id: "face-none",
-        label: "Facial consistency",
-        group: "face",
-        raw: "no faces",
-        score: 0.5,
-        weight: 0,
-        confidence: 0,
-        finding: "No faces detected — facial-consistency checks were not applicable.",
-        reliability: "not-applicable",
+    const out: DetectorSignal[] = [];
+    for (const id of ["noise", "histogram"]) {
+      const c = ctx.checks.find((k) => k.id === id);
+      if (!c) {
+        out.push(
+          skipped(
+            `artifact-${id}`,
+            id,
+            "image",
+            "This measurement was not produced for this run.",
+          ),
+        );
+        continue;
+      }
+      out.push({
+        id: `artifact-${id}`,
+        label: c.label,
+        group: "image",
+        raw: c.display,
+        score: c.score,
+        weight: c.weight,
+        confidence: c.status === "skip" ? 0 : 80,
+        evidence: c.finding,
+        reliability: c.status,
       });
-      return signals;
     }
-
-    const agg = buildFaceAggregate(ctx.faces);
-    if (agg.faceScore === null) {
-      signals.push({
-        id: "face-none",
-        label: "Facial consistency",
-        group: "face",
-        raw: "no faces",
-        score: 0.5,
-        weight: 0,
-        confidence: 0,
-        finding: "No face passed the measurement thresholds — the face checks contributed no vote.",
-        reliability: "not-applicable",
-      });
-      return signals;
-    }
-
-    const faceCheck: Check | null = agg.check ?? null;
-    signals.push({
-      id: "face-consistency",
-      label: "Facial consistency",
-      group: "face",
-      raw: `${(agg.faceScore * 100).toFixed(0)}% lean · ${ctx.faces.length} face(s)`,
-      score: agg.faceScore,
-      weight: FUSION_WEIGHTS.face,
-      confidence: 82,
-      finding:
-        `Faces were measured in ${ctx.faces.length} region(s); area-weighted face-level lean = ${(agg.faceScore * 100).toFixed(0)}%. ` +
-        (faceCheck
-          ? faceCheck.finding
-          : "No decisive face check fired."),
-      reliability: faceCheck?.status ?? "ok",
-    });
-
-    return signals;
+    return out;
   }
 }
 
@@ -454,296 +528,578 @@ export class FaceManipulationDetector extends Detector {
  * FrequencyDetector — FFT power-spectrum analysis.
  *
  * Reports the radial power-slope, the periodic upsampling peak and the
- * high-frequency energy share measured on the (downscaled) image/video
- * plane. These are the same numbers the existing `spectrum` check uses;
- * the detector maps them into the fused evidence report.
+ * high-frequency energy share actually measured on the analysed plane.
  */
 export class FrequencyDetector extends Detector {
   readonly name = "Frequency-domain detector";
   readonly version = "1.0.0";
-  readonly group = "spectral";
+  readonly group: DetectorGroup = "spectral";
 
   async run(ctx: DetectorContext): Promise<DetectorSignal[]> {
-    const spectrum = ctx.checks.find((c) => c.id === "spectrum");
-    if (!spectrum) {
-      return [{
-        id: "freq-none",
-        label: "Frequency spectrum",
-        group: "spectral",
-        raw: "skipped (too small)",
-        score: 0.5,
-        weight: 0,
-        confidence: 0,
-        finding: "The analysed plane is too small for spectral analysis.",
-        reliability: "not-applicable",
-      }];
+    const c = ctx.checks.find((k) => k.id === "spectrum");
+    if (!c || c.status === "skip") {
+      return [
+        skipped(
+          "spectrum",
+          "Frequency spectrum (FFT)",
+          "spectral",
+          c?.finding ??
+            "The analysed plane was too small for a 2D FFT, so no spectral evidence was measured.",
+        ),
+      ];
     }
-
-    const slope = spectrum.raw as string;
-    const peak = spectrum.display as string;
-    return [{
-      id: "freq-spectrum",
-      label: "Frequency spectrum (FFT)",
-      group: "spectral",
-      raw: `${slope} · ${peak}`,
-      score: spectrum.score,
-      weight: FUSION_WEIGHTS.spectral,
-      confidence: 85,
-      finding: spectrum.finding,
-      reliability: spectrum.status,
-    }];
+    const sig = ctx.signal;
+    return [
+      measured({
+        id: "spectrum",
+        label: "Frequency spectrum (FFT)",
+        group: "spectral",
+        raw: c.display,
+        score: c.score,
+        weight: FUSION_WEIGHTS.spectral,
+        confidence: 85,
+        evidence:
+          c.finding +
+          (sig
+            ? ` High-frequency energy share = ${(sig.spectrum.hfRatio * 100).toFixed(1)}%.`
+            : ""),
+      }),
+    ];
   }
 }
 
 /**
- * MetadataDetector — EXIF / C2PA / AI signature read.
+ * CompressionDetector — JPEG block grid + error-level analysis.
+ *
+ * Separated from the visual-artifact family because a grid/ELA signal is
+ * evidence about the *encoding history* of the file, not about its content.
+ */
+export class CompressionDetector extends Detector {
+  readonly name = "Compression & resampling detector";
+  readonly version = "1.0.0";
+  readonly group: DetectorGroup = "compression";
+
+  async run(ctx: DetectorContext): Promise<DetectorSignal[]> {
+    const out: DetectorSignal[] = [];
+    for (const id of ["grid", "ela", "seam"]) {
+      const c = ctx.checks.find((k) => k.id === id);
+      if (!c) {
+        out.push(
+          skipped(`compression-${id}`, id, "compression", "This measurement was not produced for this run."),
+        );
+        continue;
+      }
+      out.push({
+        id: `compression-${id}`,
+        label: c.label,
+        group: "compression",
+        raw: c.display,
+        score: c.score,
+        weight: c.weight,
+        confidence: c.status === "skip" ? 0 : 78,
+        evidence: c.finding,
+        reliability: c.status,
+      });
+    }
+    return out;
+  }
+}
+
+/**
+ * MetadataDetector — EXIF / encoder / generator signatures.
+ *
+ * Absence of EXIF is explicitly *not* treated as evidence of generation: it
+ * only leans slightly synthetic, and the wording says so.
  */
 export class MetadataDetector extends Detector {
   readonly name = "Metadata detector";
   readonly version = "1.0.0";
-  readonly group = "metadata";
+  readonly group: DetectorGroup = "metadata";
 
   async run(ctx: DetectorContext): Promise<DetectorSignal[]> {
     const md = ctx.metadata;
     if (!md) {
-      return [{
-        id: "meta-none",
-        label: "Container metadata",
-        group: "metadata",
-        raw: "no bytes",
-        score: 0.5,
-        weight: 0,
-        confidence: 0,
-        finding: "No metadata was parsed for this container.",
-        reliability: "not-applicable",
-      }];
+      return [
+        skipped(
+          "metadata",
+          "Container metadata",
+          "metadata",
+          "Metadata parsing was disabled for this run, so no metadata evidence was measured.",
+        ),
+      ];
     }
+    const c = ctx.checks.find((k) => k.id === "metadata");
+    const qf = md.tags["EstimatedJpegQuality"];
 
-    const sig: {
-      score: number;
-      reliability: "ok" | "warn" | "flag" | "not-applicable";
-      finding: string;
-    } = md.aiSignatures.length
-      ? {
-          score: 0.97,
-          reliability: "flag",
-          finding: `Known generator/tool signatures found: ${md.aiSignatures.join(", ")}. Direct evidence of AI tooling on this file (inference, not proof).`,
-        }
-      : md.c2pa
-        ? {
-            score: 0.45,
-            reliability: "warn",
-            finding: "C2PA Content Credentials present. Verify the signed claims at contentcredentials.org — presence alone neither proves nor disproves generation.",
-          }
-        : md.hasExif
-          ? {
-              score: 0.15,
-              reliability: "ok",
-              finding: "Camera EXIF present. Camera-origin metadata supports authenticity, though it can be forged.",
-            }
-          : !md.c2pa && !md.aiSignatures
-            ? {
-                score: 0.55,
-                reliability: "warn",
-                finding: "No camera EXIF or content-credentials markers found. Consistent with edits, screenshots, web-resaved files or renders — weak evidence on its own.",
-              }
-            : {
-                score: 0.68,
-                reliability: "flag",
-                finding:
-                  "Near-lossless encoding with no EXIF and no content credentials. Cameras and social platforms re-encode at much lower quality and keep provenance — a stripped, near-lossless JPEG is the signature of a programmatic render or a saved generator output. This is provenance inference, not proof of generation.",
-              };
-
-    return [{
-      id: "meta-info",
-      label: `Metadata & provenance (${md.format})`,
-      group: "metadata",
-      raw: `${md.format}${md.hasExif ? " · EXIF" : " · no EXIF"}${md.c2pa ? " · C2PA" : ""}${md.aiSignatures.length ? ` · ${md.aiSignatures.length} AI marker(s)` : ""}`,
-      score: sig.score,
-      weight: FUSION_WEIGHTS.metadata,
-      confidence: md.aiSignatures.length ? 92 : 78,
-      finding: sig.finding,
-      reliability: sig.reliability,
-    }];
+    // Provenance inference is deliberately *not* folded into the metadata
+    // score — it lives in ProvenanceDetector, so the report can keep
+    // "DETECTION" and "PROVENANCE" visibly separate.
+    const s = c?.score ?? 0.5;
+    return [
+      measured({
+        id: "metadata",
+        label: `Metadata (${md.format})`,
+        group: "metadata",
+        raw:
+          `${md.format}` +
+          `${md.hasExif ? " · EXIF" : " · no EXIF"}` +
+          `${md.aiSignatures.length ? ` · ${md.aiSignatures.length} AI marker(s)` : ""}` +
+          `${qf ? ` · QF≈${qf}` : ""}`,
+        score: s,
+        weight: FUSION_WEIGHTS.metadata,
+        confidence: md.aiSignatures.length > 0 ? 92 : 78,
+        evidence:
+          c?.finding ??
+          (md.aiSignatures.length > 0
+            ? `Known generator/tool signatures found: ${md.aiSignatures.join(", ")}.`
+            : "No metadata evidence was measured."),
+      }),
+    ];
   }
 }
 
 /**
- * ProvenanceDetector — Content Credentials / C2PA presence and
- * near-lossless-JPEG inference.
+ * ProvenanceDetector — C2PA / Content Credentials.
+ *
+ * DETECTION vs PROVENANCE, kept apart on purpose:
+ *   - Detection asks "do the pixels/bytes look synthesised?"
+ *   - Provenance asks "does the file carry a signed claim about its origin?"
+ * A file with no provenance information is NOT automatically fake, and its
+ * absence contributes zero weight to the fusion score.
  */
 export class ProvenanceDetector extends Detector {
   readonly name = "Provenance detector (C2PA)";
   readonly version = "1.0.0";
-  readonly group = "provenance";
+  readonly group: DetectorGroup = "provenance";
 
   async run(ctx: DetectorContext): Promise<DetectorSignal[]> {
     const md = ctx.metadata;
     if (!md) {
-      return [{
-        id: "prov-none",
-        label: "Provenance evidence",
-        group: "provenance",
-        raw: "none",
-        score: 0.5,
-        weight: 0,
-        confidence: 0,
-        finding: "No metadata parsed — provenance cannot be assessed.",
-        reliability: "not-applicable",
-      }];
+      return [
+        skipped(
+          "provenance",
+          "Provenance (C2PA)",
+          "provenance",
+          "No metadata was parsed, so provenance could not be assessed. Absence of provenance is not evidence of fakery.",
+        ),
+      ];
     }
 
     if (md.c2pa) {
-      return [{
-        id: "prov-c2pa",
-        label: "C2PA / Content Credentials",
-        group: "provenance",
-        raw: "present",
-        score: 0.45,
-        weight: FUSION_WEIGHTS.provenance,
-        confidence: 70,
-        finding:
-          "C2PA Content Credentials detected. Verify the signed claims at contentcredentials.org — presence alone neither proves nor disproves generation. A signed record is strong evidence ONLY when its claims are inspected, not when the presence flag is read as generation proof.",
-        reliability: "warn",
-      }];
+      return [
+        {
+          id: "provenance",
+          label: "Provenance (C2PA)",
+          group: "provenance",
+          raw: "content credentials present",
+          score: 0.5,
+          weight: FUSION_WEIGHTS.provenance,
+          confidence: 70,
+          evidence:
+            "C2PA Content Credentials were found in the file. A signed record is meaningful only when its claims are inspected at contentcredentials.org — presence alone neither proves nor disproves generation, so this signal contributes neutrally.",
+          reliability: "warn",
+        },
+      ];
     }
 
-    const qf = md.tags["EstimatedJpegQuality"];
-    if (qf !== undefined && Number(qf) >= PROVENANCE_MIN_QF) {
-      return [{
-        id: "prov-negated",
-        label: "Provenance negated (near-lossless + no provenance)",
-        group: "provenance",
-        raw: `QF>=${qf}`,
-        score: 0.68,
-        weight: FUSION_WEIGHTS.provenance,
-        confidence: 75,
-        finding:
-          "No EXIF and no content credentials on a near-lossless JPEG. Cameras and platforms keep provenance at far lower quality, so a stripped, near-lossless file is consistent with programmatic output. This is provenance inference, not proof of generation — a file without provenance is NOT automatically fake.",
-        reliability: "flag",
-      }];
+    const qfRaw = md.tags["EstimatedJpegQuality"];
+    const qf = qfRaw !== undefined ? Number(qfRaw) : NaN;
+    if (md.aiSignatures.length > 0) {
+      return [
+        {
+          id: "provenance",
+          label: "Provenance (C2PA)",
+          group: "provenance",
+          raw: `generator signature: ${md.aiSignatures[0]}`,
+          score: 0.95,
+          weight: FUSION_WEIGHTS.provenance,
+          confidence: 90,
+          evidence: `The file itself names an AI generator (${md.aiSignatures.join(", ")}). This is a claim made by the file about its own origin, corroborated by the pixel-level detectors.`,
+          reliability: "flag",
+        },
+      ];
     }
 
-    return [{
-      id: "prov-absent",
-      label: "Provenance evidence",
-      group: "provenance",
-      raw: "absent",
-      score: 0.5,
-      weight: 0,
-      confidence: 0,
-      finding:
-        "No C2PA markers provenanced. Absent provenance is neutral: it does not imply generation and neither does a missing EXIF alone.",
-      reliability: "not-applicable",
-    }];
+    if (!md.hasExif && Number.isFinite(qf) && qf >= PROVENANCE_MIN_QF) {
+      return [
+        {
+          id: "provenance",
+          label: "Provenance (C2PA)",
+          group: "provenance",
+          raw: `no credentials · QF≈${qf}`,
+          score: 0.68,
+          weight: FUSION_WEIGHTS.provenance,
+          confidence: 72,
+          evidence:
+            `JPEG quantization tables show near-lossless encoding (quality ≈ ${qf} ≥ ${PROVENANCE_MIN_QF}) while the file carries no EXIF and no content credentials. ` +
+            "Cameras and social platforms re-encode at much lower quality and retain provenance, so a stripped near-lossless file is consistent with a programmatic render or a saved generator output. " +
+            "This is provenance *inference*, not proof of generation, and it is deliberately kept separate from detection evidence.",
+          reliability: "flag",
+        },
+      ];
+    }
+
+    return [
+      {
+        id: "provenance",
+        label: "Provenance (C2PA)",
+        group: "provenance",
+        raw: "absent",
+        score: 0.5,
+        weight: 0,
+        confidence: 0,
+        evidence:
+          "No C2PA content credentials are present. Absent provenance is neutral: it does not imply generation, and a missing EXIF alone is never treated as evidence of AI generation.",
+        reliability: "not-applicable",
+      },
+    ];
   }
 }
 
-const PROVENANCE_MIN_QF = 96;
+/**
+ * FaceManipulationDetector — per-face consistency.
+ *
+ * Uses the engine's own `buildFaceAggregate` so the reported face lean is
+ * numerically identical to the one the verdict consumed. Faces whose sub-checks
+ * were all skipped (portrait frames, tiny crops) do not vote.
+ */
+export class FaceManipulationDetector extends Detector {
+  readonly name = "Face manipulation detector";
+  readonly version = "1.0.0";
+  readonly group: DetectorGroup = "face";
+
+  async run(ctx: DetectorContext): Promise<DetectorSignal[]> {
+    if (ctx.engine.faceDetector.status === "unavailable") {
+      return [
+        skipped(
+          "face-consistency",
+          "Face consistency",
+          "face",
+          `Face detector unavailable (${ctx.engine.faceDetector.detail ?? "model failed to load"}), so no faces were localised and no face evidence was measured.`,
+        ),
+      ];
+    }
+    if (ctx.faces.length === 0) {
+      return [
+        skipped(
+          "face-consistency",
+          "Face consistency",
+          "face",
+          "No face was detected in this media, so facial consistency was not applicable.",
+        ),
+      ];
+    }
+
+    const agg = buildFaceAggregate(ctx.faces);
+    if (agg.faceScore === null) {
+      return [
+        skipped(
+          "face-consistency",
+          "Face consistency",
+          "face",
+          "Every detected face was skipped (portrait frame or crop too small to measure), so no face vote was cast.",
+        ),
+      ];
+    }
+
+    return [
+      {
+        id: "face-consistency",
+        label: "Face consistency",
+        group: "face",
+        raw: `${(agg.faceScore * 100).toFixed(0)}% lean · ${ctx.faces.length} face(s)`,
+        score: agg.faceScore,
+        weight: FUSION_WEIGHTS.face,
+        confidence: agg.check ? 82 : 60,
+        evidence:
+          agg.check?.finding ??
+          `Faces were measured in ${ctx.faces.length} region(s); area-weighted lean ${(agg.faceScore * 100).toFixed(0)}%.`,
+        reliability: agg.check?.status ?? "ok",
+      },
+    ];
+  }
+}
 
 /**
- * VideoTemporalDetector — per-frame + temporal consistency (video only).
+ * VideoTemporalDetector — frame-to-frame consistency.
  *
- * Consumes the video-thread frames and temporal statistics produced by
- * the existing pipeline (`video.ts`) and exposes them as detector
- * signals, so a video is never classified from a single arbitrary
- * frame.
+ * Consumes the temporal statistics already computed by `video.ts`, so a video
+ * is never classified from a single arbitrary frame.
  */
 export class VideoTemporalDetector extends Detector {
   readonly name = "Video temporal consistency detector";
   readonly version = "1.0.0";
-  readonly group = "temporal";
+  readonly group: DetectorGroup = "temporal";
 
   async run(ctx: DetectorContext): Promise<DetectorSignal[]> {
-    if (!ctx.temporal) {
-      return [{
-        id: "video-none",
-        label: "Temporal consistency",
-        group: "temporal",
-        raw: "n/a",
-        score: 0.5,
-        weight: 0,
-        confidence: 0,
-        finding: "No temporal statistics were computed (not a video or frames were skipped).",
-        reliability: "not-applicable",
-      }];
+    const t = ctx.temporal;
+    if (!t) {
+      return [
+        skipped(
+          "temporal",
+          "Temporal consistency",
+          "temporal",
+          ctx.kind === "video"
+            ? "No temporal statistics were produced — too few frames could be sampled."
+            : "Temporal consistency applies to video runs only.",
+        ),
+      ];
     }
 
-    const t = ctx.temporal;
-    return [{
-      id: "video-temporal",
-      label: "Temporal consistency",
-      group: "temporal",
-      raw: `flicker ${(t.flicker * 100).toFixed(1)}% · jumps ${t.lightJumps} · jitter ${(t.faceJitter * 100).toFixed(1)}% · cuts ${t.cuts}`,
-      score: combineVideoScores(t),
-      weight: FUSION_WEIGHTS.temporal,
-      confidence: 80,
-      finding:
-        `Frame-to-frame noise flicker ${(t.flicker * 100).toFixed(1)}%, lighting jumps ${t.lightJumps}, detected scene cuts ${t.cuts}, mean face-geometry displacement ${(t.faceJitter * 100).toFixed(1)}% of frame size per frame. ` +
-        (t.cuts > 0
-          ? `Scene cuts ${t.cuts} exclude cut boundaries from the flicker/consistency statistics. `
-          : "No scene cuts were detected.") +
-        (t.flicker >= 0.06
-          ? "Rapidly oscillating sensor noise between frames is a hallmark of per-frame synthesis or face reenactment."
-          : "Noise evolves smoothly across frames, as in a continuous recording."),
-      reliability: t.flicker >= 0.06 ? "warn" : "ok",
-    }];
-  }
-}
+    const sFlicker = ramp(t.flicker, 0.06, 0.3);
+    const sCv = ramp(t.scoreCv, 0.12, 0.38);
+    const sJitter = t.faceJitter > 0 ? ramp(t.faceJitter, 0.04, 0.18) : 0;
+    const sLights = ramp(t.lightJumps, 1, 6) * 0.5;
+    const withFaces = ctx.faces.length > 0;
+    const score = clamp(
+      withFaces
+        ? 0.35 * sFlicker + 0.3 * sCv + 0.25 * sJitter + 0.1 * sLights
+        : 0.45 * sFlicker + 0.35 * sCv + 0.2 * sLights,
+      0,
+      1,
+    );
 
-function combineVideoScores(t: TemporalStatsType): number {
-  const sFlicker = 1 - (1 / (1 + Math.exp(-8 * (t.flicker - 0.03))));
-  const sLights = Math.min(1, t.lightJumps / 6) * 0.5;
-  const sCv = 1 - (1 / (1 + Math.exp(-6 * (t.scoreCv - 0.12))));
-  const sJitter = t.faceJitter > 0.04 ? 1 - (1 / (1 + Math.exp(-12 * (t.faceJitter - 0.05)))) : 0;
-  const base = (sFlicker * 0.5 + sLights * 0.25 + sCv * 0.25) > 0.5 ? 0.6 : 0.45;
-  const sJitterBoost = Math.max(0.1, Math.min(1, sJitter * 1.4));
-  return 0.5 * base + 0.5 * sJitterBoost;
+    const raw =
+      `flicker ${(t.flicker * 100).toFixed(1)}% · CV ${t.scoreCv.toFixed(2)} · ` +
+      `jumps ${t.lightJumps} · cuts ${t.cuts} · no-face ${(t.noFaceRatio * 100).toFixed(0)}%`;
+    const evidence =
+      `Frame-to-frame noise flicker ${(t.flicker * 100).toFixed(1)}%, per-frame score dispersion CV ${t.scoreCv.toFixed(2)}, ` +
+      `${t.lightJumps} lighting jump(s) outside ${t.cuts} detected scene cut(s), ` +
+      `mean face-geometry displacement ${(t.faceJitter * 100).toFixed(1)}% of frame size per sampled frame, ` +
+      `${(t.noFaceRatio * 100).toFixed(0)}% of sampled frames had no detectable face. ` +
+      (t.cuts > 0
+        ? "Cut boundaries are excluded from the flicker statistics. "
+        : "No scene cuts were detected. ") +
+      (score >= 0.5
+        ? "Noise that oscillates between frames, inconsistent lighting and unstable geometry are the core temporal signatures of per-frame synthesis."
+        : "Noise, lighting and geometry evolve smoothly, as in a continuous recording.");
+
+    return [
+      measured({
+        id: "temporal",
+        label: "Temporal consistency",
+        group: "temporal",
+        raw,
+        score,
+        weight: FUSION_WEIGHTS.temporal,
+        confidence: withFaces ? 82 : 74,
+        evidence,
+      }),
+    ];
+  }
 }
 
 /**
- * AudioVideoSyncDetector — audio signal profile (video only).
+ * AudioVideoSyncDetector — audio continuity.
  *
- * Profiles the decoded audio track for clipping, DC offset, silence and
- * loudness uniformity. v1 does NOT classify cloned voices; this detector
- * returns only the signal profile, honestly labelled.
+ * Honest about scope: this profiles the decoded track (clipping, DC offset,
+ * silence ratio, loudness uniformity, spectral centroid). It does **not**
+ * classify cloned voices, and the report says so on every run.
  */
 export class AudioVideoSyncDetector extends Detector {
-  readonly name = "Audio/video synchronization detector";
+  readonly name = "Audio / video continuity detector";
   readonly version = "1.0.0";
-  readonly group = "audio";
+  readonly group: DetectorGroup = "audio";
 
   async run(ctx: DetectorContext): Promise<DetectorSignal[]> {
-    if (!ctx.temporal) {
-      // No video context → no audio analysis path is available.
-      return [{
-        id: "audio-none",
-        label: "Audio profile",
-        group: "audio",
-        raw: "no-audio",
-        score: 0.5,
-        weight: 0,
-        confidence: 0,
-        finding: "Audio analysis is only available for video runs with an audio track.",
-        reliability: "not-applicable",
-      }];
+    const a = ctx.audio;
+    if (ctx.kind !== "video") {
+      return [
+        skipped(
+          "audio",
+          "Audio continuity",
+          "audio",
+          "Audio analysis applies to video runs only.",
+        ),
+      ];
+    }
+    if (!a || !a.present) {
+      return [
+        skipped(
+          "audio",
+          "Audio continuity",
+          "audio",
+          "No decodable audio track was present in this file, so no audio evidence was measured.",
+        ),
+      ];
     }
 
-    // In the browser the audio profile is produced by analyzeAudio();
-    // here the detector is the honest wrapper that reports whatever the
-    // audio thread produced. The actual `analyzeAudio`/`makeAudioCheck`
-    // live in audio.ts (already imported by the runner).
-    return [{
-      id: "audio-profile",
-      label: "Audio signal profile",
-      group: "audio",
-      raw: "no-decoded-audio",
-      score: 0.5,
-      weight: FUSION_WEIGHTS.audio,
-      confidence: 0,
-      finding:
-        "v1 does not classify cloned voices; the audio profile is measured only (clipping, DC offset, silence ratio, loudness uniformity). Treat as supporting evidence, not a voice-clone verdict.",
-      reliability: ctx.temporal !== null ? "warn" : "not-applicable",
-    }];
+    const sFlat = ramp(a.uniformity, 0.93, 0.99);
+    const sClip = clamp(a.clippingRatio / 0.01, 0, 1);
+    const score = clamp(0.6 * sFlat + 0.4 * sClip, 0, 1);
+
+    return [
+      measured({
+        id: "audio",
+        label: "Audio continuity",
+        group: "audio",
+        raw: `uniformity ${(a.uniformity * 100).toFixed(1)}% · clip ${(a.clippingRatio * 100).toFixed(3)}%`,
+        score,
+        weight: FUSION_WEIGHTS.audio,
+        confidence: 70,
+        evidence:
+          `Track profiled over ${a.durationSec.toFixed(1)}s at ${a.sampleRate} Hz: loudness uniformity ` +
+          `${(a.uniformity * 100).toFixed(1)}%, clipping ${(a.clippingRatio * 100).toFixed(3)}%, ` +
+          `DC offset ${a.dcOffset.toFixed(4)}, silence ${(a.silenceRatio * 100).toFixed(1)}%, ` +
+          `spectral centroid ${a.spectralCentroid.toFixed(3)}. ` +
+          a.note +
+          " Scope note: this detector profiles the audio signal only — it is not a voice-clone classifier.",
+      }),
+    ];
   }
+}
+
+/* ==================================================================== */
+/* Registry + fusion                                                    */
+/* ==================================================================== */
+
+/** The shipped portfolio, in reporting order. */
+export function defaultDetectors(): Detector[] {
+  return [
+    new ImageAIDetector(),
+    new VisualArtifactDetector(),
+    new FrequencyDetector(),
+    new CompressionDetector(),
+    new MetadataDetector(),
+    new ProvenanceDetector(),
+    new FaceManipulationDetector(),
+    new VideoTemporalDetector(),
+    new AudioVideoSyncDetector(),
+  ];
+}
+
+export interface DetectorRun {
+  detector: string;
+  version: string;
+  group: DetectorGroup;
+  score: number;
+  confidence: number;
+  reliability: SignalReliability;
+  ranInMs: number;
+}
+
+export interface FusionResult {
+  /** combined synthetic-leaning score over the weighted detector signals */
+  fusionScore: number;
+  /** per-evidence-category summary, in registry order */
+  categories: EvidenceCategory[];
+  /** every signal, annotated with the detector that produced it */
+  signals: DetectorSignal[];
+  /** one row per detector, for the developer dashboard */
+  perDetector: DetectorRun[];
+  /** how many detectors actually contributed a weighted signal */
+  activeDetectors: number;
+  /** total wall-clock cost of the detector portfolio */
+  elapsedMs: number;
+  /** 0..1 — shared weighting across the categories that ran */
+  evidenceStrength: number;
+}
+
+const now = () =>
+  typeof performance !== "undefined" ? performance.now() : Date.now();
+
+/**
+ * Run every detector and fuse its signals.
+ *
+ * The fused score is a weighted mean over signals that actually ran. Signals
+ * that could not be measured carry weight 0 and therefore cannot move the
+ * score in either direction — a skipped detector is never silently treated as
+ * a clean bill of health.
+ */
+export async function mergeEvidence(
+  detectors: Detector[],
+  ctx: DetectorContext,
+  onProgress?: (note: string, pct: number) => void,
+): Promise<FusionResult> {
+  const started = now();
+  const signals: DetectorSignal[] = [];
+  const perDetector: DetectorRun[] = [];
+
+  for (let i = 0; i < detectors.length; i++) {
+    const d = detectors[i];
+    onProgress?.(
+      `${d.name} v${d.version}`,
+      Math.round(((i + 1) / detectors.length) * 100),
+    );
+    const t0 = now();
+    let produced: DetectorSignal[] = [];
+    try {
+      produced = await d.run(ctx);
+    } catch (err) {
+      // A detector that throws is reported as "did not run" — the run must not
+      // fail because one optional measurement blew up.
+      produced = [
+        skipped(
+          `${d.group}-error`,
+          d.name,
+          d.group,
+          `Detector failed: ${err instanceof Error ? err.message : String(err)}. Its evidence was excluded from the score.`,
+        ),
+      ];
+    }
+    for (const s of produced) {
+      signals.push({ ...s, detector: d.name, detectorVersion: d.version });
+    }
+    const scored = produced.filter((s) => s.weight > 0);
+    perDetector.push({
+      detector: d.name,
+      version: d.version,
+      group: d.group,
+      score: scored.length > 0 ? mean(scored.map((s) => s.score)) : 0.5,
+      confidence: scored.length > 0 ? Math.max(...scored.map((s) => s.confidence)) : 0,
+      reliability: scored.length === 0
+        ? "skip"
+        : scored.some((s) => s.reliability === "flag")
+          ? "flag"
+          : scored.some((s) => s.reliability === "warn")
+            ? "warn"
+            : "ok",
+      ranInMs: Math.round(now() - t0),
+    });
+  }
+
+  /* ---- per-category rollup (registry order preserved) ---- */
+  const categories: EvidenceCategory[] = [];
+  const byGroup = new Map<DetectorGroup, DetectorSignal[]>();
+  for (const s of signals) {
+    const list = byGroup.get(s.group) ?? [];
+    list.push(s);
+    byGroup.set(s.group, list);
+  }
+  for (const [group, list] of byGroup) {
+    const weighted = list.filter((s) => s.weight > 0);
+    categories.push({
+      id: group,
+      label: DETECTOR_GROUP_LABEL[group],
+      signals: list,
+      flagged: weighted.some((s) => s.score >= 0.65),
+      maxScore: list.reduce((a, s) => Math.max(a, s.weight > 0 ? s.score : 0), 0),
+      weight: weighted.reduce((a, s) => a + s.weight, 0),
+    });
+  }
+
+  /* ---- fused score ---- */
+  const active = signals.filter((s) => s.weight > 0);
+  const wsum = active.reduce((a, s) => a + s.weight, 0);
+  const score = wsum > 0 ? active.reduce((a, s) => a + s.score * s.weight, 0) / wsum : 0.5;
+
+  /* Evidence strength: how many independent families actually voted, tempered
+     by how much they agree. 0 means "nothing measurable ran". */
+  const cats = categories.filter((c) => c.weight > 0);
+  const coverage = clamp(cats.length / 4, 0, 1);
+  const agreement =
+    cats.length > 1
+      ? clamp(1 - stdDev(cats.map((c) => c.maxScore)) * 2, 0, 1)
+      : 0.5;
+  const evidenceStrength = clamp(0.6 * coverage + 0.4 * agreement, 0, 1);
+
+  return {
+    fusionScore: score,
+    categories,
+    signals,
+    perDetector,
+    activeDetectors: perDetector.filter((d) => d.reliability !== "skip").length,
+    elapsedMs: Math.round(now() - started),
+    evidenceStrength,
+  };
 }

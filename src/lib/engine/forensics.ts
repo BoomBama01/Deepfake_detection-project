@@ -16,7 +16,6 @@ import {
   logLogSlope,
   mean,
   median,
-  periodProminence,
   percentile,
   powerSpectrum,
   radialProfile,
@@ -93,8 +92,6 @@ export interface SignalAnalysis {
   sharpness: number;
   metadata: MetadataFindings | null;
 }
-
-const ELA_Q = 0.9;
 
 /**
  * Evidence-quality bands — when these say the evidence base is compromised,

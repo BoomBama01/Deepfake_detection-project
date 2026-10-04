@@ -162,7 +162,9 @@ http.route({
         result = null;
       }
     }
-    const { resultJson: _ignored, ...scan } = detail.scan;
+    // resultJson is parsed above and returned as `result`, so strip the raw copy
+    const { resultJson, ...scan } = detail.scan;
+    void resultJson;
     return json(
       { ...scan, disclaimer: DISCLAIMER, result },
       200,

@@ -1,6 +1,6 @@
 /** Band measurement: sharpness (p90 tile gradient) and estimated QF per
  *  sample × perturbation. Used to set EVIDENCE bands with real numbers. */
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { analyzeFile, decodeImage, type DecodedImage } from "./lib/pipeline";

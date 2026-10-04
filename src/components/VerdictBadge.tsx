@@ -1,13 +1,17 @@
 import { BadgeCheck, CircleHelp, Frown, Loader, TriangleAlert } from "lucide-react";
 import type { Verdict } from "@/lib/engine/types";
 
+/**
+ * Three outcomes, never two. `inconclusive` is a real result, not a hedge on a
+ * confident answer: when the evidence is weak or the detectors disagree, that
+ * is what the badge says.
+ */
 const SHORT: Record<Verdict, string> = {
-  real: "Real",
-  /** legacy no-score rows only — the engine never produces this verdict */
-  inconclusive: "Low confidence",
+  real: "Likely authentic",
+  inconclusive: "Inconclusive",
   likely_ai: "Likely AI-generated",
   likely_deepfake: "Likely deepfake",
-  error: "Analysis failed",
+  error: "Analysis unavailable",
 };
 
 const TONE: Record<Verdict, { fg: string; border: string; bg: string }> = {
