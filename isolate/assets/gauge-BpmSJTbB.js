@@ -1,0 +1,1 @@
+import{c as o}from"./index-BuKq5TLM.js";const e=[["path",{d:"m6 9 6 6 6-6",key:"qrunsl"}]],c=o("chevron-down",e);const n=[["path",{d:"m12 14 4-4",key:"9kzdfg"}],["path",{d:"M3.34 19a10 10 0 1 1 17.32 0",key:"19p75a"}]],t=o("gauge",n);export{c as C,t as G};
