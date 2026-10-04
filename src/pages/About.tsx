@@ -75,6 +75,10 @@ export default function About() {
             behind, shows you the evidence, and states plainly when the
             evidence runs out. Here is the whole pipeline, in order.
           </p>
+          <p className="mt-5 font-mono text-[11px] uppercase tracking-[0.22em] text-muted-foreground">
+            Created by{" "}
+            <span className="text-foreground">Rohit</span>
+          </p>
         </header>
 
         <section className="mt-10 space-y-4">
@@ -182,6 +186,10 @@ export default function About() {
             </Link>
           </Button>
         </section>
+
+        <p className="mt-10 border-t border-border pt-6 text-center font-mono text-[11px] uppercase tracking-[0.22em] text-muted-foreground">
+          Created by Rohit
+        </p>
       </main>
 
       <Footer />
