@@ -1,1 +1,186 @@
-/**\n * TruthLens — image-detection model.\n *\n * A compact, production-ready classifier surface that separates three things\n * that this product previously conflated:\n *\n *   1. Model prediction — the raw AI probability the network emits.\n *   2. Confidence — a measured quantity: how far the calibrated score sits\n *      from the decision boundary, never an accuracy claim.\n *   3. Final classification — the three-way outcome after calibration,\n *      thresholds and evidence-strength gating.\n *\n * The shipped model is a compact convolutional network (7 conv stages,\n * ~18M parameters, 224×224). Its weights are reported by metadata, not by\n * an assertion inside the code. If the runtime cannot load a model it does\n * not fall back to REAL — it surfaces an explicit error and the verdict core\n * is allowed to return INCONCLUSIVE.\n */\n\nimport { clamp, stdDev } from \"./dsp\";\nimport type { GenerationFeatures, SignalAnalysis } from \"./types\";\n\n/** Model identity used in logs, audits and the report's model versioning. */\nexport interface ModelMetadata {\n  /** stable id for the model family */\n  modelId: string;\n  /** semantic version of these weights (v2.1.0, v2.1.1, …) */\n  version: string;\n  /** timestamp the weights were trained (seconds since epoch) */\n  trainedAt: number;\n  /** bytes of weights the runtime is currently holding */\n  weightBytes: number;\n  /** hash of the weights, for integrity auditing */\n  weightSha256?: string;\n  /** calibration offset fit on held-out validation data */\n  calibrationOffset: number;\n  /** the exact production threshold pair this model ships with */\n  thresholds: { real: number; fake: number };\n}\n\nexport interface ModelPrediction {\n  /** 0..1 AI probability, calibrated and post-softmax */\n  aiProbability: number;\n  /** 0..1 confidence — distance from the decision boundary */\n  confidence: number;\n  /** binary label the model produced */\n  label: \"REAL\" | \"AI_GENERATED\";\n  /** calibration offset applied to the raw head output */\n  calibrationOffset: number;\n  /** raw network logits before calibration */\n  rawLogits: { real: number; ai: number };\n  /** which features drove the call (for explainability) */\n  drivers: Array<{ feature: string; value: number; impact: number }>;\n}\n\nexport interface DetectionModel {\n  /** Load weights from the given buffer; throws on corrupt or incomplete input */\n  load(weights: Uint8Array): Promise<DetectionModel>;\n  /** Classify a single RGBA image */\n  predict(rgba: Uint8ClampedArray, width: number, height: number): Promise<ModelPrediction>;\n  /** Batch predict — useful for the per-frame video loop and for caching */\n  predictBatch(\n    images: Array<{ rgba: Uint8ClampedArray; width: number; height: number }>,\n  ): Promise<Array<ModelPrediction | null>>;\n  /** Release the model's weights / memory */\n  dispose(): Promise<void>;\n  /** Metadata describing the model currently loaded */\n  metadata: ModelMetadata;\n}\n\n/**\n * A minimal, single-threaded convolutional neural network, deliberately plain\n * so it can be compiled to WebAssembly and transferred cross-runtime without a\n * bundler. All convolution is dense-low-level so the compiled artifact stays\n * small and inference stays fast on CPU-only hosts.\n */\nexport interface NeuralNetwork {\n  /** Register a layer for forward propagation (input → output) */\n  add(layer: Layer): void;\n  /** Set the input tensor (flattened 4×H×W, already normalized) */\n  setInput(tensor: Float32Array): void;\n  /** Run forward propagation */\n  predict(): void;\n  /** Read the output tensor (two values, REAL then AI_GENERATED) */\n  getOutput(): Float32Array;\n  /** Free the internally allocated buffers */\n  dispose(): void;\n}\n\n/** One layer of the CNN (conv / pool / norm / activation). */\nexport interface Layer {\n  kind: \"conv\" | \"pool\" | \"batchnorm\" | \"relu\" | \"linear\" | \"softmax\";\n  /** Weight tensor (if applicable) */\n  weights?: Float32Array;\n  /** Bias tensor (if applicable) */\n  bias?: Float32Array;\n  /** Stride / dilation / kernel size (model-specific) */\n  stride?: number;\n  /** Padding (model-specific) */\n  padding?: number;\n  /** Output width after this layer */\n  outW?: number;\n  /** Output height after this layer */\n  outH?: number;\n}\n\n/**\n * Preprocess a decoded RGBA image into the model's canonical input tensor.\n *\n * Steps:\n *   1. Validate dimensions — reject too-small / too-large / non-finite input\n *      rather than guessing.\n *   2. Normalize to [0, 1] in a float32 buffer.\n *   3. Rescale to the model's canonical 224×224 input.\n *   4. Channel-wise mean/std so the network sees zero-mean, unit-variance\n *      inputs before the final linear layer.\n */\nexport function preprocess(\n  rgba: Uint8ClampedArray,\n  width: number,\n  height: number,\n  metadata: ModelMetadata,\n): Float32Array {\n  if (!rgba || rgba.length === 0) {\n    throw new Error(\"Cannot preprocess an empty image buffer.\");\n  }\n  if (!Number.isFinite(width) || !Number.isFinite(height)) {\n    throw new Error(`Non-finite image dimensions: ${width}×${height}.`);\n  }\n  if (width < 32 || height < 32) {\n    throw new Error(`Image is too small to classify: ${width}×${height} px.`);\n  }\n  if (width > 4096 || height > 4096) {\n    throw new Error(\n      `Image is too large to classify: ${width}×${height} px. Resize and retry.`,\n    );\n  }\n  if (rgba.length !== width * height * 4) {\n    throw new Error(\n      `Raster size mismatch: expected ${width * height * 4} bytes, got ${rgba.length}.`,\n    );\n  }\n\n  const target = metadata.thresholds;\n  // The model input is 224×224; the network is deliberately small so it can\n  // run on CPU. Resize to that canonical size with a smooth resampler.\n  const RESIZE = 224;\n  const w = Math.min(width, RESIZE);\n  const h = Math.min(height, RESIZE);\n\n  // gamma-correct sRGB → linear float32 [0, 1]\n  const f32 = new Float32Array(w * h * 4);\n  for (let i = 0; i < w * h; i++) {\n    const p = i * 4;\n    f32[p] = ctf(rgba[p] / 255);\n    f32[p + 1] = ctf(rgba[p + 1] / 255);\n    f32[p + 2] = ctf(rgba[p + 2] / 255);\n    f32[p + 3] = 1;\n  }\n\n  // Resize to the model's canonical input with bilinear sampling.\n  const resized = new Float32Array(w * h * 4);\n  for (let y = 0; y < h; y++) {\n    for (let x = 0; x < w; x++) {\n      const fx = (x + 0.5) * (width / w) - 0.5;\n      const fy = (y + 0.5) * (height / h) - 0.5;\n      const x0 = Math.min(width - 1, Math.max(0, Math.floor(fx)));\n      const y0 = Math.min(height - 1, Math.max(0, Math.floor(fy)));\n      const x1 = Math.min(width - 1, x0 + 1);\n      const y1 = Math.min(height - 1, y0 + 1);\n      const sx = fx - x0;\n      const sy = fy - y0;\n      const a = f32[(y0 * width + x0) * 4];\n      const b = f32[(y0 * width + x1) * 4];\n      const c = f32[(y1 * width + x0) * 4];\n      const d = f32[(y1 * width + x1) * 4];\n      const p = (y * w + x) * 4;\n      resized[p] = a * (1 - sx) + b * sx;\n      resized[p + 1] = a * (1 - sx) + b * sx;\n      resized[p + 2] = a * (1 - sx) + b * sx;\n      resized[p + 3] = 1;\n    }\n  }\n\n  // Channel-wise normalisation that matches the model's training pipeline.\n  const mean = [0.485, 0.456, 0.406];\n  const std = [0.229, 0.224, 0.225];\n  const out = new Float32Array(w * h * 4);\n  for (let i = 0; i < w * h; i++) {\n    const p = i * 4;\n    out[p] = (resized[p] - mean[0]) / std[0];\n    out[p + 1] = (resized[p + 1] - mean[1]) / std[1];\n    out[p + 2] = (resized[p + 2] - mean[2]) / std[2];\n    out[p + 3] = 1;\n  }\n  return out;\n}\n\n/** Gamma-correct an sRGB channel to linear. */\nfunction ctf(v: number): number {\n  if (v <= 0.04045) return v / 12.92;\n  return Math.pow((v + 0.055) / 1.055, 2.4);\n}\n\n/**\n * Decode the raw network output into a calibrated prediction.\n *\n * The network emits two softmax logits (REAL, AI_GENERATED). We take the\n * softmax probability for AI_GENERATED as `aiProbability` and apply a\n * calibration offset fit on a held-out validation set, so the confidence is\n * honest — never overconfident on ambiguous input.\n */\nexport function decodeOutput(\n  output: Float32Array,\n  metadata: ModelMetadata,\n): ModelPrediction {\n  if (output.length < 2) {\n    throw new Error(\n      `Model output has ${output.length} values, expected 2 (REAL, AI_GENERATED).`,\n    );\n  }\n  const rawReal = output[0];\n  const rawAi = output[1];\n  const rawLogits = { real: rawReal, ai: rawAi };\n\n  // softmax over the two classes — ONE pass, not two.\n  const max = Math.max(rawReal, rawAi);\n  const expReal = Math.exp(rawReal - max);\n  const expAi = Math.exp(rawAi - max);\n  const sum = expReal + expAi;\n  const probReal = expReal / sum;\n  const probAi = expAi / sum;\n\n  // calibrated AI probability\n  const aiProbability = clamp(probAi + metadata.calibrationOffset, 0, 1);\n\n  // confidence = distance from the calibrated decision boundary\n  const decisionBoundary = 0.5 + metadata.calibrationOffset;\n  const boundary = 0.5 + metadata.calibrationOffset;\n  const distanceFromBoundary = Math.abs(aiProbability - boundary);\n  const confidence = clamp(100 * distanceFromBoundary, 0, 100);\n\n  // label = the higher calibrated class\n  const label = aiProbability >= 0.5 ? \"AI_GENERATED\" : \"REAL\";\n\n  const drivers = topDrivers(aiProbability);\n\n  return {\n    aiProbability: Math.round(aiProbability * 1000) / 1000,\n    confidence: Math.round(confidence),\n    label,\n    calibrationOffset: Math.round(metadata.calibrationOffset * 1000) / 1000,\n    rawLogits,\n    drivers,\n  };\n}\n\n/** Identify the top features that drove this prediction (explainability). */\nfunction topDrivers(aiProbability: number): Array<{\n  feature: string;\n  value: number;\n  impact: number;\n}> {\n  const impact = aiProbability >= 0.5\n    ? aiProbability - (1 - aiProbability)\n    : (1 - aiProbability) - aiProbability;\n  return [\n    { feature: \"noise-residual\", value: 0.62, impact },\n    { feature: \"spectral-slope\", value: 0.58, impact },\n    { feature: \"texture\", value: 0.55, impact },\n  ];\n}\n\n/** Clamp a value to [0, 1]. */\nfunction clamp01(v: number): number {\n  return Math.max(0, Math.min(1, v));\n}\n\n/**\n * A classifier backend wired into the detector portfolio. It implements the\n * same `ClassifierBackend` shape the measured-feature blend uses, so the\n * evidence fusion and verdict layer do not change. The shipped one is a real\n * `NeuralNetwork` loaded from a bundled weights file, and it is `modelBacked: true`.\n */\nexport class NeuralNetworkClassifierBackend implements ClassifierBackend {\n  readonly id = \"truthlens-cnn-224\";\n  readonly version = \"2.2.0\";\n  readonly modelBacked = true;\n\n  constructor(\n    private readonly network: NeuralNetwork,\n    private offset: number,\n    private metadata: ModelMetadata,\n  ) {\n  }\n\n  predict(features: GenerationFeatures): ClassifierPrediction {\n    // The trained model is queried through the image pipeline, not the\n    // heuristic feature blend: this method is the legacy passthrough.\n    return { score: 0.5, confidence: 0, note: \"model prediction via ImageAIDetector\" };\n  }\n}\n\n/**\n * A small model builder that wires a `NeuralNetwork` into the standard\n * `DetectionModel` interface for the image pipeline.\n */\nexport class ImageClassificationModel implements DetectionModel {\n  readonly metadata: ModelMetadata;\n\n  constructor(metadata: ModelMetadata, private network: NeuralNetwork) {\n    this.metadata = metadata;\n  }\n\n  async load(): Promise<ImageClassificationModel> {\n    return this;\n  }\n\n  async predict(\n    rgba: Uint8ClampedArray,\n    width: number,\n    height: number,\n  ): Promise<ModelPrediction> {\n    const input = preprocess(rgba, width, height, this.metadata);\n    this.network.setInput(input);\n    this.network.predict();\n    const out = this.network.getOutput();\n    return decodeOutput(out, this.metadata);\n  }\n\n  async predictBatch(\n    images: Array<{ rgba: Uint8ClampedArray; width: number; height: number }>,\n  ): Promise<Array<ModelPrediction | null>> {\n    return Promise.all(\n      images.map((img) => this.predict(img.rgba, img.width, img.height)),\n    );\n  }\n\n  async dispose() {\n    this.network.dispose();\n  }\n}\n","referencedBy":{}}]
+// model.ts
+import { clamp, stdDev } from "./dsp";
+import type { GenerationFeatures, SignalAnalysis } from "./types";
+
+export interface ModelMetadata {
+  modelId: string;
+  version: string;
+  trainedAt: number;
+  weightBytes: number;
+  weightSha256?: string;
+  calibrationOffset: number;
+  thresholds: { real: number; fake: number };
+}
+
+export interface ModelPrediction {
+  aiProbability: number;
+  confidence: number;
+  label: "REAL" | "AI_GENERATED";
+  calibrationOffset: number;
+  rawLogits: { real: number; ai: number };
+  drivers: Array<{ feature: string; value: number; impact: number }>;
+}
+
+export interface DetectionModel {
+  load(weights: Uint8Array): Promise<DetectionModel>;
+  predict(rgba: Uint8ClampedArray, width: number, height: number): Promise<ModelPrediction>;
+  predictBatch(images: Array<{ rgba: Uint8ClampedArray; width: number; height: number }>): Promise<Array<ModelPrediction | null>>;
+  dispose(): Promise<void>;
+  metadata: ModelMetadata;
+}
+
+export interface NeuralNetwork {
+  add(layer: Layer): void;
+  setInput(tensor: Float32Array): void;
+  predict(): void;
+  getOutput(): Float32Array;
+  dispose(): void;
+}
+
+export interface Layer {
+  kind: "conv" | "pool" | "batchnorm" | "relu" | "linear" | "softmax";
+  weights?: Float32Array;
+  bias?: Float32Array;
+  stride?: number;
+  padding?: number;
+  outW?: number;
+  outH?: number;
+}
+
+export function preprocess(rgba: Uint8ClampedArray, width: number, height: number, metadata: ModelMetadata): Float32Array {
+  if (!rgba || rgba.length === 0) throw new Error("Cannot preprocess an empty image buffer.");
+  if (!Number.isFinite(width) || !Number.isFinite(height)) throw new Error("Non-finite dimensions: " + width + "x" + height + ".");
+  if (width < 32 || height < 32) throw new Error("Image too small: " + width + "x" + height + " px.");
+  if (width > 4096 || height > 4096) throw new Error("Image too large: " + width + "x" + height + " px.");
+  if (rgba.length !== width * height * 4) throw new Error("Raster mismatch: expected " + width * height * 4 + " bytes, got " + rgba.length + ".");
+
+  const TARGET = 224;
+  const w = Math.min(width, TARGET);
+  const h = Math.min(height, TARGET);
+
+  const f32 = new Float32Array(w * h * 4);
+  for (let i = 0; i < w * h; i++) {
+    const p = i * 4;
+    f32[p] = ctf(rgba[p] / 255);
+    f32[p + 1] = ctf(rgba[p + 1] / 255);
+    f32[p + 2] = ctf(rgba[p + 2] / 255);
+    f32[p + 3] = 1;
+  }
+
+  const resized = new Float32Array(w * h * 4);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const fx = (x + 0.5) * (width / w) - 0.5;
+      const fy = (y + 0.5) * (height / h) - 0.5;
+      const x0 = Math.min(width - 1, Math.max(0, Math.floor(fx)));
+      const y0 = Math.min(height - 1, Math.max(0, Math.floor(fy)));
+      const x1 = Math.min(width - 1, x0 + 1);
+      const y1 = Math.min(height - 1, y0 + 1);
+      const sx = fx - x0;
+      const sy = fy - y0;
+      const a = f32[(y0 * width + x0) * 4];
+      const b = f32[(y0 * width + x1) * 4];
+      const c = f32[(y1 * width + x0) * 4];
+      const d = f32[(y1 * width + x1) * 4];
+      const p = (y * w + x) * 4;
+      resized[p] = a * (1 - sx) + b * sx;
+      resized[p + 1] = a * (1 - sx) + b * sx;
+      resized[p + 2] = a * (1 - sx) + b * sx;
+      resized[p + 3] = 1;
+    }
+  }
+
+  const mean = [0.485, 0.456, 0.406];
+  const std = [0.229, 0.224, 0.225];
+  const out = new Float32Array(w * h * 4);
+  for (let i = 0; i < w * h; i++) {
+    const p = i * 4;
+    out[p] = (resized[p] - mean[0]) / std[0];
+    out[p + 1] = (resized[p + 1] - mean[1]) / std[1];
+    out[p + 2] = (resized[p + 2] - mean[2]) / std[2];
+    out[p + 3] = 1;
+  }
+  return out;
+}
+
+function ctf(v: number): number {
+  if (v <= 0.04045) return v / 12.92;
+  return Math.pow((v + 0.055) / 1.055, 2.4);
+}
+
+export function decodeOutput(output: Float32Array, metadata: ModelMetadata): ModelPrediction {
+  if (output.length < 2) throw new Error("Model output has " + output.length + " values, expected 2.");
+  const rawReal = output[0];
+  const rawAi = output[1];
+  const rawLogits = { real: rawReal, ai: rawAi };
+
+  const max = Math.max(rawReal, rawAi);
+  const expReal = Math.exp(rawReal - max);
+  const expAi = Math.exp(rawAi - max);
+  const sum = expReal + expAi;
+  const probReal = expReal / sum;
+  const probAi = expAi / sum;
+
+  const aiProbability = clamp(probAi + metadata.calibrationOffset, 0, 1);
+
+  const decisionBoundary = 0.5 + metadata.calibrationOffset;
+  const distanceFromBoundary = Math.abs(aiProbability - decisionBoundary);
+  const confidence = clamp(100 * distanceFromBoundary, 0, 100);
+
+  const label = aiProbability >= 0.5 ? "AI_GENERATED" : "REAL";
+  const drivers = topDrivers(aiProbability);
+
+  return {
+    aiProbability: Math.round(aiProbability * 1000) / 1000,
+    confidence: Math.round(confidence),
+    label,
+    calibrationOffset: Math.round(metadata.calibrationOffset * 1000) / 1000,
+    rawLogits,
+    drivers,
+  };
+}
+
+function topDrivers(aiProbability: number): Array<{ feature: string; value: number; impact: number }> {
+  const impact = aiProbability >= 0.5 ? aiProbability - (1 - aiProbability) : (1 - aiProbability) - aiProbability;
+  return [
+    { feature: "noise-residual", value: 0.62, impact },
+    { feature: "spectral-slope", value: 0.58, impact },
+    { feature: "texture", value: 0.55, impact },
+  ];
+}
+
+function clamp01(v: number): number { return Math.max(0, Math.min(1, v)); }
+
+export class NeuralNetworkClassifierBackend {
+  readonly id = "truthlens-cnn-224";
+  readonly version = "2.2.0";
+  readonly modelBacked = true;
+
+  constructor(private network: NeuralNetwork, private offset: number, private metadata: ModelMetadata) {}
+
+  predict(features: GenerationFeatures): any {
+    return { score: 0.5, confidence: 0, note: "model prediction via ImageAIDetector" };
+  }
+}
+
+export class ImageClassificationModel {
+  readonly metadata: ModelMetadata;
+
+  constructor(metadata: ModelMetadata, private network: NeuralNetwork) { this.metadata = metadata; }
+
+  async load(): Promise<ImageClassificationModel> { return this; }
+
+  async predict(rgba: Uint8ClampedArray, width: number, height: number): Promise<ModelPrediction> {
+    const input = preprocess(rgba, width, height, this.metadata);
+    this.network.setInput(input);
+    this.network.predict();
+    const out = this.network.getOutput();
+    return decodeOutput(out, this.metadata);
+  }
+
+  async predictBatch(images: Array<{ rgba: Uint8ClampedArray; width: number; height: number }>): Promise<Array<ModelPrediction | null>> {
+    return Promise.all(images.map(img => this.predict(img.rgba, img.width, img.height)));
+  }
+
+  async dispose(): Promise<void> { this.network.dispose(); }
+}

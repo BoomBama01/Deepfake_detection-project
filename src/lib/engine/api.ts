@@ -1,1 +1,113 @@
-/**\n * TruthLens — server-side API security, validation and structured logging.\n *\n * Intended for the Convex HTTP actions that accept uploaded files or remote\n * URLs. The browser analysis runs locally, but the server side must still\n * enforce hard limits, validate every claim by content (never by filename or\n * by the client MIME type), and emit structured, rate-limited logs.\n */\n\nimport { createHash } from \"crypto\";\n\n/** Hard limits enforced before any work begins. */\nexport const SECURITY = {\n  // File sizes: images (in browser) and server-side fetches share this cap.\n  imageMaxBytes: 30 * 1024 * 1024,\n  videoMaxBytes: 200 * 1024 * 1024,\n  // Remote URL fetch cap (must stay under Convex payload limits).\n  remoteUrlMaxBytes: 9 * 1024 * 1024,\n  remoteUrlTimeoutMs: 30_000,\n  // Video containers: maximum duration decoded from the file header.\n  videoMaxSeconds: 360,\n  // Frame-count caps for sampling.\n  maxFrames: 180,\n  // Frames per single analysis; large videos are sampled, never decoded in full.\n  minFrames: 2,\n  // Rate limiting: requests per window per caller identity.\n  rateWindowMs: 60_000,\n  rateMaxPerWindow: 60,\n  // Memory: an upper bound on how many bytes we keep in RAM at once.\n  maxMemoryBytes: 128 * 1024 * 1024,\n} as const;\n\nexport type MediaKind = \"image\" | \"video\";\nexport type LogSeverity = \"info\" | \"warn\" | \"error\";\n\nexport interface LogEntry {\n  /** unique id for this request, propagated to every subsystem */\n  requestId: string;\n  /** who asked for the work (account id or guest device id) */\n  caller: string;\n  /** kind of media being worked on */\n  kind: MediaKind;\n  /** original file size, or 0 if unknown */\n  fileSize: number;\n  /** measured content type after magic-byte sniffing */\n  contentType: string;\n  /** wall-clock time from start to finish (ms) */\n  elapsedMs: number;\n  /** model / detector version used */\n  modelVersion?: string;\n  /** calibrated AI probability reported, when one exists */\n  aiProbability?: number;\n  /** 0..1 confidence, not an accuracy claim */\n  confidence?: number;\n  /** final classification */\n  verdict: string;\n  /** error, when one occurred */\n  error?: string;\n  /** which stage failed, when applicable */\n  stage?: string;\n  /** generated at */\n  ts: number;\n}\n\nconst REQUEST_ID_HEADER = \"X-Request-ID\";\n\n/** Generate a stable request id for this incoming request. */\nexport function requestId(req: Request): string {\n  return req.headers.get(REQUEST_ID_HEADER) ?? crypto.randomUUID();\n}\n\n/** Structured log entry, JSON-serialisable; no raw media bytes ever logged. */\nexport function log(entry: Omit<LogEntry, \"ts\">): string {\n  return JSON.stringify({ ...entry, ts: Date.now() });\n}\n\n/**\n * Format of data written by the audit logger so a deployment can tail it.\n */\nexport interface AuditLog {\n  requestId: string;\n  caller: string;\n  kind: MediaKind;\n  fileName: string;\n  fileSize: number;\n  fileHash?: string;\n  contentType: string;\n  verdict: string;\n  aiProbability?: number;\n  confidence?: number;\n  elapsedMs: number;\n  modelVersion?: string;\n  error?: string;\n  ts: number;\n}\n\n// ---------------------------------------------------------------------------\n// Validation helpers\n// ---------------------------------------------------------------------------\n\nexport const IMAGE_SIGNATURES: Array<\n  { test: (b: Uint8Array) => boolean; mime: string; ext: string }\n> = [\n  {\n    test: (b) => b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff,\n    mime: \"image/jpeg\",\n    ext: \"jpg\",\n  },\n  {\n    test: (b) => b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47,\n    mime: \"image/png\",\n    ext: \"png\",\n  },\n  {\n    test: (b) => b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50,\n    mime: \"image/webp\",\n    ext: \"webp\",\n  },\n  {\n    test: (b) => b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46,\n    mime: \"image/gif\",\n    ext: \"gif\",\n  },\n];\n\nexport const VIDEO_SIGNATURES: Array<\n  { test: (b: Uint8Array) => boolean; mime: string; ext: string }\n> = [\n  {\n    test: (b) => b[0] === 0x00 && b[1] === 0x00 && b[2] === 0x00 && b[3] === 0x1c && b[4] === 0x66 && b[5] === 0x74 && b[6] === 0x79 && b[7] === 0x70,\n    mime: \"video/mp4\",\n    ext: \"mp4\",\n  },\n  {\n    test: (b) => b[0] === 0x1a && b[1] === 0x45 && b[2] === 0xdf && b[3] === 0xa3,\n    mime: \"video/webm\",\n    ext: \"webm\",\n  },\n  {\n    test: (b) => b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46 && b[8] === 0x41 && b[9] === 0x56 && b[10] === 0x49,\n    mime: \"video/quicktime\",\n    ext: \"mov\",\n  },\n];\n\n/**\n * Check the real content type from magic bytes and reject anything that does\n * not match the expected family. Never trusts the client's `Content-Type`\n * header or the file's extension.\n */\nexport function sniffMedia(bytes: Uint8Array, expected: MediaKind): {\n  kind: MediaKind;\n  mime: string;\n  ext: string;\n} {\n  const chunk = bytes.length > 4096 ? bytes.subarray(0, 4096) : bytes;\n  const image = IMAGE_SIGNATURES.find((s) => s.test(chunk));\n  const video = VIDEO_SIGNATURES.find((s) => s.test(chunk));\n\n  if (expected === \"image\" && !image) {\n    throw new Error(`Unsupported or corrupt image — the byte signature is not JPEG, PNG, WEBP or GIF (checked on the bytes, not the extension).`);\n  }\n  if (expected === \"video\" && !video) {\n    throw new Error(\"That file does not look like a video container.\");\n  }\n  return {\n    kind: expected,\n    mime: image?.mime ?? video?.mime ?? \"unknown\",\n    ext: image?.ext ?? video?.ext ?? \"\",\n  };\n}\n\n/**\n * Hard file size limit, enforced before any heavy work. Images are checked\n * client-side too, but a second enforcement on the server is load bearing.\n */\nexport function checkSize(\n  kind: MediaKind,\n  size: number,\n  requestId: string,\n): void {\n  const max = kind === \"image\" ? SECURITY.imageMaxBytes : SECURITY.videoMaxBytes;\n  if (size > max) {\n    throw new Error(\n      `File is ${(size / 1024 / 1024).toFixed(1)} MB — the ${kind} limit is ${max / 1024 / 1024} MB.`,\n    );\n  }\n}\n\n// ---------------------------------------------------------------------------\n// Request-scoped workings\n// ---------------------------------------------------------------------------\n\nlet requestSeq = 0;\n\n/**\n * Create a bounded temp file with automatic lifetime cleanup. Filenames are\n * generated from a counter (never from user input), and the file is removed\n * when the returned cleanup is called.\n */\nexport function createTempFile(\n  prefix: string,\n  bytes: Uint8Array,\n): { path: string; cleanup: () => void } {\n  const id = `${Date.now()}-${++requestSeq}-${crypto.randomUUID().slice(0, 8)}`;\n  // In-browser the storage is JS memory; in Node the caller places bytes at a\n  // real path. We deliberately avoid touching the filesystem for images\n  // processed purely in the browser.\n  const path = \`/${prefix}-${id}.bin\`;\n  return { path, cleanup: () => undefined };\n}\n\n/**\n * Track a temp file so it is guaranteed to be cleaned up, even on error.\n */\nexport function trackTempFile(\n  pending: Set<string>,\n  path: string,\n  cleanup: () => void,\n): void {\n  pending.add(path);\n  // best-effort: the caller owns the real deletion; the bounded set keeps\n  // long-running analysis loops from accumulating state.\n  if (pending.size > 100) pending.delete(pending.values().next().value as string);\n}\n\n// ---------------------------------------------------------------------------\n// Rate limiter (fixed window, in-memory)\n// ---------------------------------------------------------------------------\n\nexport interface RateLimiter {\n  /** true if the caller is allowed; false when throttled */\n  allow: boolean;\n  /** remaining tokens in this window */\n  remaining: number;\n}\n\nexport interface RateBucket {\n  count: number;\n  windowStart: number;\n}\n\nconst buckets = new Map<string, RateBucket>();\n\n/** Check a caller identity against the fixed-window rate limit. */\nexport function checkRate(\n  identity: string,\n  windowMs = SECURITY.rateWindowMs,\n  max = SECURITY.rateMaxPerWindow,\n): RateLimiter {\n  const now = Date.now();\n  const b = buckets.get(identity) ?? { count: 0, windowStart: now };\n  if (now - b.windowStart > windowMs) {\n    b.count = 1;\n    b.windowStart = now;\n  } else {\n    b.count += 1;\n  }\n  buckets.set(identity, b);\n  return {\n    allow: b.count <= max,\n    remaining: Math.max(0, max - b.count),\n  };\n}\n\n// ---------------------------------------------------------------------------\n// Structured logging\n// ---------------------------------------------------------------------------\n\nexport function auditLog(entry: AuditLog): void {\n  // In a real deployment the caller wires this to a log sink (file, syslog,\n  // observability platform). It deliberately does not contain any media\n  // bytes, only hashes, sizes and classifications.\n  console.log(log(entry));\n}\n\n/** Log the start of an analysis request. */\nexport function auditStart(\n  requestId: string,\n  caller: string,\n  kind: MediaKind,\n  fileName: string,\n  fileSize: number,\n  contentType: string,\n): string {\n  const entry: AuditLog = {\n    requestId,\n    caller,\n    kind,\n    fileName,\n    fileSize,\n    contentType,\n    verdict: \"pending\",\n    ts: Date.now(),\n  };\n  auditLog(entry);\n  return requestId;\n}\n\n/** Log the completion of an analysis. */\nexport function auditComplete(\n  entry: Omit<AuditLog, \"ts\"> & { elapsedMs: number },\n): void {\n  auditLog({ ts: Date.now(), ...entry });\n}\n\n/** Log a failure — always include the request id so it can be traced. */\nexport function auditError(\n  requestId: string,\n  caller: string,\n  kind: MediaKind,\n  stage: string,\n  error: string,\n  fileSize = 0,\n  fileName = \"\",\n  contentType = \"unknown\",\n): void {\n  auditLog({\n    requestId,\n    caller,\n    kind,\n    fileName,\n    fileSize,\n    contentType,\n    verdict: \"error\",\n    stage,\n    error,\n    ts: Date.now(),\n  });\n}\n","referencedBy":{}}]
+// api.ts - server-side API security, validation and structured logging
+import { createHash } from "crypto";
+
+export const SECURITY = {
+  imageMaxBytes: 30 * 1024 * 1024,
+  videoMaxBytes: 200 * 1024 * 1024,
+  remoteUrlMaxBytes: 9 * 1024 * 1024,
+  remoteUrlTimeoutMs: 30000,
+  videoMaxSeconds: 360,
+  maxFrames: 180,
+  minFrames: 2,
+  rateWindowMs: 60000,
+  rateMaxPerWindow: 60,
+  maxMemoryBytes: 128 * 1024 * 1024,
+} as const;
+
+export type MediaKind = "image" | "video";
+export type LogSeverity = "info" | "warn" | "error";
+
+export interface LogEntry {
+  requestId: string;
+  caller: string;
+  kind: MediaKind;
+  fileSize: number;
+  contentType: string;
+  elapsedMs: number;
+  modelVersion?: string;
+  aiProbability?: number;
+  confidence?: number;
+  verdict: string;
+  error?: string;
+  stage?: string;
+  ts: number;
+}
+
+const REQUEST_ID_HEADER = "X-Request-ID";
+
+export function requestId(req: Request): string {
+  return req.headers.get(REQUEST_ID_HEADER) ?? crypto.randomUUID();
+}
+
+export function log(entry: Omit<LogEntry, "ts">): string {
+  return JSON.stringify({ ...entry, ts: Date.now() });
+}
+
+export interface AuditLog {
+  requestId: string;
+  caller: string;
+  kind: MediaKind;
+  fileName: string;
+  fileSize: number;
+  fileHash?: string;
+  contentType: string;
+  verdict: string;
+  aiProbability?: number;
+  confidence?: number;
+  elapsedMs: number;
+  modelVersion?: string;
+  error?: string;
+  ts: number;
+}
+
+export const IMAGE_SIGNATURES = [
+  { test: (b: Uint8Array) => b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff, mime: "image/jpeg", ext: "jpg" },
+  { test: (b: Uint8Array) => b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47, mime: "image/png", ext: "png" },
+  { test: (b: Uint8Array) => b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50, mime: "image/webp", ext: "webp" },
+  { test: (b: Uint8Array) => b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46, mime: "image/gif", ext: "gif" },
+];
+
+export const VIDEO_SIGNATURES = [
+  { test: (b: Uint8Array) => b[0] === 0x00 && b[1] === 0x00 && b[2] === 0x00 && b[3] === 0x1c && b[4] === 0x66 && b[5] === 0x74 && b[6] === 0x79 && b[7] === 0x70, mime: "video/mp4", ext: "mp4" },
+  { test: (b: Uint8Array) => b[0] === 0x1a && b[1] === 0x45 && b[2] === 0xdf && b[3] === 0xa3, mime: "video/webm", ext: "webm" },
+  { test: (b: Uint8Array) => b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46 && b[8] === 0x41 && b[9] === 0x56 && b[10] === 0x49, mime: "video/quicktime", ext: "mov" },
+];
+
+export function sniffMedia(bytes: Uint8Array, expected: MediaKind): { kind: MediaKind; mime: string; ext: string } {
+  const chunk = bytes.length > 4096 ? bytes.subarray(0, 4096) : bytes;
+  const image = IMAGE_SIGNATURES.find(s => s.test(chunk));
+  const video = VIDEO_SIGNATURES.find(s => s.test(chunk));
+
+  if (expected === "image" && !image) {
+    throw new Error("Unsupported or corrupt image - signature is not JPEG, PNG, WEBP or GIF.");
+  }
+  if (expected === "video" && !video) {
+    throw new Error("That file does not look like a video container.");
+  }
+  return { kind: expected, mime: image?.mime ?? video?.mime ?? "unknown", ext: image?.ext ?? video?.ext ?? "" };
+}
+
+export function checkSize(kind: MediaKind, size: number, requestId: string): void {
+  const max = kind === "image" ? SECURITY.imageMaxBytes : SECURITY.videoMaxBytes;
+  if (size > max) {
+    throw new Error("File is " + (size / 1024 / 1024).toFixed(1) + " MB - the " + kind + " limit is " + (max / 1024 / 1024) + " MB.");
+  }
+}
+
+export function auditStart(requestId: string, caller: string, kind: MediaKind, fileName: string, fileSize: number, contentType: string): string {
+  const entry: AuditLog = { requestId, caller, kind, fileName, fileSize, contentType, verdict: "pending", ts: Date.now() };
+  console.log(log(entry));
+  return requestId;
+}
+
+export function auditComplete(entry: Omit<AuditLog, "ts"> & { elapsedMs: number }): void {
+  auditLog({ ts: Date.now(), ...entry });
+}
+
+export function auditError(requestId: string, caller: string, kind: MediaKind, stage: string, error: string, fileSize: number = 0, fileName: string = "", contentType: string = "unknown"): void {
+  auditLog({ requestId, caller, kind, fileName, fileSize, contentType, verdict: "error", stage, error, ts: Date.now() });
+}
+
+export function auditLog(entry: AuditLog): void {
+  console.log(log(entry));
+}

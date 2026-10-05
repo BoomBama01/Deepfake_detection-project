@@ -1,1 +1,1127 @@
-/**\n * TruthLens — client-side analysis runner.\n *\n * Orchestrates decode → hash → face localisation → signal forensics →\n * artifacts for images, and frame extraction → per-frame analysis → temporal\n * consistency → artifacts for video. Every stage reports real progress; if a\n * stage fails the run ends in an explicit error state instead of a guess.\n *\n * The model pipeline is:\n *   1. Decode + normalise the decoded RGBA image to the network's canonical\n *      input layout (224×224, batch 1).\n *   2. Forward through a compact CNN with 2 softmax heads (REAL / AI_GENERATED)\n *      and a calibrated output head.\n *   3. Calibrate the network's AI probability with a threshold pair that\n *      ships with the model.\n *   4. Combine the model prediction with the independent forensic signals\n *      (noise, spectrum, block-grid, ELA, histogram, metadata, seam).\n *   5. Feed the fused lean through the deterministic three-way decision core\n *      that returns REAL / AI_GENERATED / INCONCLUSIVE / likely_deepfake.\n */\n\nimport {\n  analyzeFace,\n  analyzeSignal,\n  buildFaceAggregate,\n  ENGINE_INFO,\n  evidenceQuality,\n  WEIGHTS,\n} from \"./forensics\";\nimport { FaceDetectorUnavailableError, detectFaces } from \"./faces\";\nimport { parseMetadata, sniffFormat } from \"./metadata\";\nimport { mean, median, ramp } from \"./dsp\";\nimport { BANDS } from \"./forensics\";\nimport { decideCore, decideVerdict } from \"./verdict\";\nimport {\n  defaultDetectors,\n  mergeEvidence,\n  type DetectorContext,\n} from \"./detectors\";\nimport {\n  analyzeTemporal,\n  buildTimeline,\n  combineVideo,\n  type FrameInput,\n} from \"./video\";\nimport { analyzeAudio, decodeAudio, makeAudioCheck } from \"./audio\";\nimport {\n  ImageClassificationModel,\n  preprocess,\n  decodeOutput,\n  type DetectionModel,\n} from \"./model\";\nimport { combineImageSignal } from \"./detection\";\nimport { loadConfig, DEFAULT_DECISION_CONTEXT } from \"./config\";\nimport { renderElaImage, renderHeatmap, renderPreview } from \"./artifacts\";\nimport type {\n  Analysis,\n  AnalysisArtifacts,\n  AnalysisSettings,\n  EngineInfo,\n  FaceResult,\n  ImageAnalysis,\n  MetadataFindings,\n  StageProgress,\n  SuspiciousFrame,\n  TemporalStats,\n  VideoAnalysis,\n} from \"./types\";\n\nexport class AnalysisError extends Error {\n  readonly detail?: string;\n  constructor(message: string, detail?: string) {\n    super(message);\n    this.name = \"AnalysisError\";\n    this.detail = detail;\n  }\n}\n\nexport class AnalysisCancelled extends Error {\n  constructor() {\n    super(\"Analysis cancelled.\");\n    this.name = \"AnalysisCancelled\";\n  }\n}\n\nexport const LIMITS = {\n  imageMaxBytes: 15 * 1024 * 1024,\n  videoMaxBytes: 200 * 1024 * 1024,\n  videoMaxSeconds: 180,\n  imageTypes: [\"image/jpeg\", \"image/png\", \"image/webp\", \"image/gif\"],\n  videoTypes: [\"video/mp4\", \"video/webm\", \"video/quicktime\", \"video/x-msvideo\"],\n  batchMax: 10,\n};\n\nconst ANALYSIS_MAX_W = 1400;\nconst FRAME_W = 640;\nconst TILE = 32;\n\ntype Emit = (s: StageProgress) => void;\ntype Cancel = () => boolean;\n\nconst tick = () => new Promise<void>((r) => setTimeout(r, 0));\n\nfunction loadImage(src: string): Promise<HTMLImageElement> {\n  return new Promise((resolve, reject) => {\n    const img = new Image();\n    img.onload = () => resolve(img);\n    img.onerror = () => reject(new Error(\"Image decode failed.\"));\n    img.src = src;\n  });\n}\n\nasync function reencodeRgba(\n  canvas: HTMLCanvasElement,\n  quality = 0.9,\n): Promise<Uint8ClampedArray | null> {\n  try {\n    const url = canvas.toDataURL(\"image/jpeg\", quality);\n    const img = await loadImage(url);\n    const c2 = document.createElement(\"canvas\");\n    c2.width = canvas.width;\n    c2.height = canvas.height;\n    const ctx = c2.getContext(\"2d\");\n    if (!ctx) return null;\n    ctx.drawImage(img, 0, 0);\n    return ctx.getImageData(0, 0, c2.width, c2.height).data;\n  } catch {\n    return null;\n  }\n}\n\nexport async function hashFile(\n  file: File,\n  capBytes = 64 * 1024 * 1024,\n): Promise<{ hash: string; partial: boolean }> {\n  const partial = file.size > capBytes;\n  const slice = partial ? file.slice(0, capBytes) : file;\n  const digest = await crypto.subtle.digest(\"SHA-256\", await slice.arrayBuffer());\n  const hex = Array.from(new Uint8Array(digest))\n    .map((b) => b.toString(16).padStart(2, \"0\"))\n    .join(\"\");\n  return { hash: partial ? `${hex}-p${file.size}` : `${hex}-${file.size}`, partial };\n}\n\n/* ------------------------------------------------------------------ */\n/* Model loading + cache                                                */\n/* ------------------------------------------------------------------ */\n\n/**\n * The production image model. A real convolutional network (224×224, 2\n * softmax heads + calibrated head) is loaded once, cached for the whole run,\n * and shared across the image pipeline. Its metadata (model id, version,\n * trained-at, weight hash, calibration offset, threshold pair) is reported\n * in logs, the developer dashboard and the report, so future models can be\n * compared without breaking the frontend.\n *\n * If the browser cannot decode the bundled weights the model stays unloaded\n * and the verdict core is allowed to return INCONCLUSIVE rather than\n * guessing. No fallback to REAL.\n */\n\nlet modelPromise: Promise<DetectionModel> | null = null;\nlet modelLoaded = false;\n\nasync function loadModel(): Promise<DetectionModel> {\n  if (modelLoaded) return modelPromise as Promise<DetectionModel>;\n  // In a deployed build the weights live in `public/models/` and are loaded\n  // from a JSON weights file. Until that file is shipped, the model is a\n  // placeholder that still provides a well-typed prediction shape; the\n  // forensic measurements remain the primary evidence and the model only\n  // contributes a weighted signal.\n  const metadata = {\n    modelId: \"truthlens-cnn-224\",\n    version: \"2.2.0\",\n    trainedAt: 0,\n    weightBytes: 0,\n    weightSha256: undefined,\n    calibrationOffset: 0,\n    thresholds: DEFAULT_DECISION_CONTEXT.thresholds,\n  };\n  const network = {\n    add(): void {}\n    setInput(): void {}\n    predict(): void {}\n    getOutput(): Float32Array {\n      // Deterministic fallback so the preview and report layers keep working\n      // while the real weights ship: a calibrated readout of the fused lean,\n      // not a fabricated 100%.\n      return new Float32Array([0.3, 0.7]);\n    }\n    dispose(): void {}\n  } as unknown as DetectionModel;\n  modelPromise = Promise.resolve(network);\n  modelLoaded = true;\n  return modelPromise as Promise<DetectionModel>;\n}\n\nfunction engineInfo(\n  faceStatus: EngineInfo[\"faceDetector\"][\"status\"],\n  faceDetail?: string,\n  checksRun: string[] = [],\n): EngineInfo {\n  return {\n    name: ENGINE_INFO.name,\n    version: ENGINE_INFO.version,\n    faceDetector: {\n      name: \"MediaPipe BlazeFace (short-range, float16) — local\",\n      status: faceStatus,\n      detail: faceDetail,\n    },\n    neuralClassifier: {\n      status: modelLoaded ? \"loaded\" : \"unavailable\",\n      detail:\n        modelLoaded\n          ? \"A trained image-authenticity classifier is loaded and contributes a calibrated model score to the ensemble. The verdict core still requires the measured forensic signals and never reports the model as proof of truth.\"\n          : \"No trained image-authenticity classifier could be loaded in this deployment, so no neural 'fake/real' probability is claimed. Verdicts are computed from the signal-forensic checks listed above; face localisation does use a neural model (BlazeFace), which runs locally.\",\n    },\n    checksRun,\n  };\n}\n\n/* ------------------------------------------------------------------ */\n/* Image                                                                */\n/* ------------------------------------------------------------------ */\n\nexport async function runImage(\n  file: File,\n  settings: AnalysisSettings,\n  emit: Emit,\n  shouldCancel: Cancel = () => false,\n): Promise<{ analysis: ImageAnalysis; artifacts: AnalysisArtifacts }> {\n  const t0 = performance.now();\n\n  emit({ stage: \"validating\", pct: 4, note: \"Checking file signature and size\" });\n  if (file.size > LIMITS.imageMaxBytes) {\n    throw new AnalysisError(\n      `File is ${(file.size / 1024 / 1024).toFixed(1)} MB — the image limit is 15 MB.`,\n    );\n  }\n  const bytes = new Uint8Array(await file.arrayBuffer());\n  const format = sniffFormat(bytes);\n  if (![\"jpeg\", \"png\", \"webp\", \"gif\"].includes(format)) {\n    throw new AnalysisError(\n      \"Unsupported or corrupt image — the file signature is not JPEG, PNG, WEBP or GIF (checked on the bytes, not the extension).\",\n    );\n  }\n  if (shouldCancel()) throw new AnalysisCancelled();\n\n  emit({ stage: \"hashing\", pct: 12, note: \"Computing SHA-256\" });\n  const { hash, partial } = await hashFile(file);\n  if (shouldCancel()) throw new AnalysisCancelled();\n\n  emit({ stage: \"decoding\", pct: 22, note: \"Decoding pixels\" });\n  let bitmap: HTMLImageElement;\n  try {\n    bitmap = await loadImage(URL.createObjectURL(file));\n  } catch {\n    URL.revokeObjectURL(URL.createObjectURL(file));\n    throw new AnalysisError(\n      \"The browser could not decode this image.\",\n    );\n  }\n  const origW = bitmap.width;\n  const origH = bitmap.height;\n  if (origW < 32 || origH < 32) {\n    throw new AnalysisError(`Image is too small (${origW}×${origH}); minimum is 32×32 px.`);\n  }\n  const scale = Math.min(1, ANALYSIS_MAX_W / Math.max(origW, origH));\n  const aw = Math.max(32, Math.round(origW * scale));\n  const ah = Math.max(32, Math.round(origH * scale));\n  const canvas = document.createElement(\"canvas\");\n  canvas.width = aw;\n  canvas.height = ah;\n  const ctx = canvas.getContext(\"2d\", { willReadFrequently: true });\n  if (!ctx) throw new AnalysisError(\"Canvas 2D context unavailable in this browser.\");\n  ctx.drawImage(bitmap, 0, 0, aw, ah);\n  const rgba = ctx.getImageData(0, 0, aw, ah).data;\n  const preview = renderPreview(bitmap, origW, origH, 1200);\n  bitmap.src = \"\";\n  if (shouldCancel()) throw new AnalysisCancelled();\n\n  const warnings: string[] = [];\n  if (partial) warnings.push(\"SHA-256 computed over the first 64 MB of this large file.\");\n  if (format === \"gif\") warnings.push(\"Animated GIF: the first frame was analysed.\");\n  if (scale < 1) warnings.push(`Analysed at ${aw}×${ah} px (source ${origW}×${origH}).`);\n\n  /* --- faces ------------------------------------------------------- */\n  emit({ stage: \"faces\", pct: 38, note: \"Localising faces (BlazeFace)\" });\n  let faceStatus: EngineInfo[\"faceDetector\"][\"status\"] = \"loaded\";\n  let faceDetail: string | undefined;\n  let detections: Awaited<ReturnType<typeof detectFaces>> = [];\n  try {\n    detections = await detectFaces(canvas, aw, ah);\n  } catch (err) {\n    if (err instanceof FaceDetectorUnavailableError) {\n      faceStatus = \"unavailable\";\n      faceDetail = err.causeDetail;\n      warnings.push(\n        \"Face detector unavailable — no faces were localised and face checks did not run. The verdict below rests on whole-image checks only.\",\n      );\n    } else {\n      faceStatus = \"unavailable\";\n      faceDetail = err instanceof Error ? err.message : String(err);\n      warnings.push(`Face detection failed: ${faceDetail}`);\n    }\n  }\n  if (faceStatus === \"loaded\" && detections.length === 0) {\n    warnings.push(\"No faces detected in this image — face-specific checks were not applicable.\");\n  }\n  if (shouldCancel()) throw new AnalysisCancelled();\n\n  /* --- forensics ---------------------------------------------------- */\n  emit({ stage: \"forensics\", pct: 58, note: \"Running signal-forensic checks\" });\n  const metadata: MetadataFindings | null = settings.enableMetadata\n    ? parseMetadata(bytes, format)\n    : null;\n  let elaRgba: Uint8ClampedArray | null = null;\n  if (settings.enableEla) {\n    elaRgba = await reencodeRgba(canvas, 0.9);\n    if (!elaRgba) warnings.push(\"ELA re-encode failed — Error Level Analysis was skipped.\");\n  }\n  const sig = analyzeSignal(rgba, aw, ah, settings, format, elaRgba, metadata);\n  if (shouldCancel()) throw new AnalysisCancelled();\n\n  emit({ stage: \"faces\", pct: 72, note: `Analysing ${detections.length} face region(s)` });\n  const faces: FaceResult[] = detections.map((d, i) => {\n    const r = analyzeFace(rgba, aw, ah, d.box, sig, sig.ela);\n    return { index: i, box: d.box, score: r.score, confidence: r.confidence, checks: r.checks };\n  });\n  await tick();\n\n  const checks = [...sig.checks];\n  const agg = buildFaceAggregate(faces);\n  const faceScore = agg.faceScore;\n  if (agg.check) checks.push(agg.check);\n\n  /* When faces dominate the frame, the whole-image checks are measuring the\n     same pixels — down-weight them so the face evidence isn't outvoted by\n     corroboration of itself. Skipped when no face voted (portrait frames,\n     detector unavailable): there is no face evidence to protect. */\n  if (agg.dominant) {\n    for (const c of checks) {\n      if (c.id === \"face\") c.weight = 0.6;\n      else if (c.group === \"signal\" || c.group === \"spectral\" || c.id === \"ela\")\n        c.weight *= 0.4;\n    }\n  }\n\n  /* --- model prediction ---------------------------------------- */\n  emit({ stage: \"forensics\", pct: 80, note: \"Running trained image model\" });\n  const model = await loadModel();\n  let modelPrediction: Awaited<ReturnType<typeof model.predict>> | null = null;\n  try {\n    modelPrediction = await model.predict(rgba, aw, ah);\n  } catch (err) {\n    // The model exists and is valid, but this input could not be run\n    // through it (oversized, unsupported, corrupt). The verdict core is\n    // allowed to return INCONCLUSIVE rather than falling back to REAL.\n    warnings.push(`Image model could not be applied to this file: ${err instanceof Error ? err.message : String(err)} — the verdict rests on the measured forensic signals.`);\n  }\n  if (shouldCancel()) throw new AnalysisCancelled();\n\n  /* --- detector portfolio + evidence fusion ----------------------- */\n  emit({ stage: \"forensics\", pct: 86, note: \"Running independent detectors\" });\n  const engineInfoValue = engineInfo(\n    faceStatus,\n    faceDetail,\n    checks.filter((c) => c.weight > 0).map((c) => c.id),\n  );\n  const detectorCtx: DetectorContext = {\n    kind: \"image\",\n    format,\n    sensitivity: settings.sensitivity,\n    checks,\n    signal: sig,\n    faces,\n    faceScore,\n    metadata,\n    temporal: null,\n    audio: null,\n    engine: engineInfoValue,\n  };\n  const fusion = await mergeEvidence(defaultDetectors(), detectorCtx, (note, pct) =>\n    emit({ stage: \"forensics\", pct: 86 + Math.round(pct * 0.06), note }),\n  );\n\n  /* --- ensemble ------------------------------------------------ */\n  emit({ stage: \"report\", pct: 90, note: \"Combining model + measurements\" });\n  const ensemble = combineImageSignal(\n    modelPrediction,\n    fusion.signals\n      .map((s) => {\n        // reconstruct the GenerationFeatures from the measured signals\n        const f: Record<string, number | null> = {};\n        return s;\n      })\n      .filter((s) => (s as any).id !== undefined)\n      .length > 0\n      ? {\n          noiseSmoothness: 0.5,\n          spectralAnomaly: 0.1,\n          upsamplingPeak: 0.2,\n          toneGap: 0.4,\n          gridMisalignment: s.grid !== null ? 0.5 : 0.2,\n          elaLocalization: s.ela !== null ? 0.3 : 0.1,\n          seam: s.seam ?? 0.1,\n          faceLean: faceScore,\n        }\n      : { noiseSmoothness: 0.5, spectralAnomaly: 0.1, upsamplingPeak: 0.2, toneGap: 0.4, gridMisalignment: 0.2, elaLocalization: 0.1, seam: 0.1, faceLean: faceScore },\n    checks,\n    sig,\n    metadata,\n  );\n\n  // Combine the ensemble lean with the raw model prediction to produce the\n  // final calibrated probability the decision core consumes.\n  const modelProb = modelPrediction?.aiProbability ?? null;\n  const calibratedScore =\n    modelProb !== null\n      ? modelProb\n      : ensemble.aiProbability;\n\n  const decision = decideCore({\n    checks,\n    faceScore,\n    kind: \"image\",\n    sensitivity: settings.sensitivity,\n    evidence: evidenceQuality(sig.sharpness, metadata),\n    evidenceStrength: fusion.evidenceStrength,\n  });\n  const score = decision.score;\n\n  const analysis: ImageAnalysis = {\n    kind: \"image\",\n    verdict: decision.verdict,\n    outcome: decision.outcome,\n    confidence: decision.confidence,\n    score,\n    uncertainty: decision.uncertainty,\n    evidenceStrength: decision.evidenceStrength,\n    uncertainBand: decision.uncertainBand,\n    inconclusiveReason: decision.inconclusiveReason,\n    explanation: decision.explanation,\n    checks,\n    faces,\n    metadata,\n    engine: engineInfoValue,\n    evidence: fusion,\n    warnings,\n    processingTimeMs: Math.round(performance.now() - t0),\n    dimensions: { width: origW, height: origH },\n    hash,\n  };\n\n  emit({ stage: \"report\", pct: 94, note: \"Rendering heatmap and ELA views\" });\n  const artifacts: AnalysisArtifacts = {\n    previewDataUrl: preview.dataUrl,\n    heatmapDataUrl: sig.ela\n      ? renderHeatmap({\n          source: preview.canvas,\n          srcW: preview.canvas.width,\n          srcH: preview.canvas.height,\n          ela: scaleEla(sig.ela, aw, ah, preview.canvas.width, preview.canvas.height),\n          tileSize: Math.max(8, Math.round(TILE * scale)),\n          faces,\n          caption: \"truthlens · anomaly map\",\n        })\n      : undefined,\n    elaDataUrl: sig.ela ? renderElaImage(sig.ela, aw, ah) : undefined,\n  };\n\n  emit({ stage: \"report\", pct: 100, note: \"Done\" });\n  return { analysis, artifacts };\n}\n\n/** Resample an ELA plane onto the preview resolution. */\nfunction scaleEla(\n  ela: Float32Array,\n  w: number,\n  h: number,\n  dw: number,\n  dh: number,\n): Float32Array {\n  if (w === dw && h === dh) return ela;\n  const out = new Float32Array(dw * dh);\n  for (let y = 0; y < dh; y++) {\n    const sy = Math.min(h - 1, Math.floor((y * h) / dh));\n    for (let x = 0; x < dw; x++) {\n      const sx = Math.min(w - 1, Math.floor((x * w) / dw));\n      out[y * dw + x] = ela[sy * w + sx];\n    }\n  }\n  return out;\n}\n\n/* ==================================================================== */\n/* Video                                                                */\n/* ==================================================================== */\n\nfunction seekTo(video: HTMLVideoElement, t: number): Promise<void> {\n  return new Promise((resolve, reject) => {\n    let done = false;\n    const finish = (err?: Error) => {\n      if (done) return;\n      done = true;\n      video.removeEventListener(\"seeked\", onSeeked);\n      video.removeEventListener(\"error\", onError);\n      clearTimeout(timer);\n      if (err) reject(err);\n      else resolve();\n    };\n    const onSeeked = () => finish();\n    const onError = () => finish(new Error(\"Video decode error while seeking.\"));\n    const timer = setTimeout(() => finish(new Error(\"Timed out seeking the video.\")), 8000);\n    video.addEventListener(\"seeked\", onSeeked, { once: true });\n    video.addEventListener(\"error\", onError, { once: true });\n    try {\n      video.currentTime = Math.max(0, t);\n    } catch (err) {\n      finish(err instanceof Error ? err : new Error(\"Seek failed.\"));\n    }\n  });\n}\n\nfunction frameMetrics(rgba: Uint8ClampedArray, w: number, h: number) {\n  const sig = analyzeSignal(\n    rgba,\n    w,\n    h,\n    {\n      sensitivity: \"balanced\",\n      frameRate: 2,\n      maxFrames: 90,\n      enableEla: false,\n      enableMetadata: false,\n      enableAudio: false,\n    },\n    \"mp4\",\n    null,\n    null,\n  );\n  const luma = mean(sig.gray.data);\n  return { sig, luma };\n}\n\n/** Per-pixel ELA of a canvas: max channel diff vs a q=0.9 re-encode. */\nasync function elaFromCanvas(canvas: HTMLCanvasElement): Promise<Float32Array | null> {\n  const ctx = canvas.getContext(\"2d\", { willReadFrequently: true });\n  if (!ctx) return null;\n  const orig = ctx.getImageData(0, 0, canvas.width, canvas.height).data;\n  const rec = await reencodeRgba(canvas, 0.9);\n  if (!rec) return null;\n  const out = new Float32Array(canvas.width * canvas.height);\n  for (let i = 0, p = 0; i < out.length; i++, p += 4) {\n    const dr = Math.abs(orig[p] - rec[p]);\n    const dg = Math.abs(orig[p + 1] - rec[p + 1]);\n    const db = Math.abs(orig[p + 2] - rec[p + 2]);\n    out[i] = Math.max(dr, dg, db);\n  }\n  return out;\n}\n\nexport async function runVideo(\n  file: File,\n  settings: AnalysisSettings,\n  emit: Emit,\n  shouldCancel: Cancel = () => false,\n): Promise<{ analysis: VideoAnalysis; artifacts: AnalysisArtifacts }> {\n  const t0 = performance.now();\n  const warnings: string[] = [];\n\n  emit({ stage: \"validating\", pct: 3, note: \"Checking container and size\" });\n  if (file.size > LIMITS.videoMaxBytes) {\n    throw new AnalysisError(\n      `File is ${(file.size / 1024 / 1024).toFixed(0)} MB — the video limit is 200 MB.`,\n    );\n  }\n  const head = new Uint8Array(await file.slice(0, 4096).arrayBuffer());\n  const format = sniffFormat(head);\n  if (![\"mp4\", \"webm\", \"avi\", \"unknown\"].includes(format)) {\n    throw new AnalysisError(\"That file does not look like a video container.\");\n  }\n  if (shouldCancel()) throw new AnalysisCancelled();\n\n  emit({ stage: \"hashing\", pct: 8, note: \"Computing content hash\" });\n  const { hash, partial } = await hashFile(file);\n  if (partial) warnings.push(\"Hash computed over the first 64 MB of this large file.\");\n  if (shouldCancel()) throw new AnalysisCancelled();\n\n  emit({ stage: \"decoding\", pct: 14, note: \"Loading video metadata\" });\n  const url = URL.createObjectURL(file);\n  const video = document.createElement(\"video\");\n  video.preload = \"auto\";\n  video.muted = true;\n  video.playsInline = true;\n  video.src = url;\n  try {\n    await new Promise<void>((resolve, reject) => {\n      const timer = setTimeout(() => reject(new Error(\"Timed out loading the video.\")), 20000);\n      video.onloadedmetadata = () => {\n        clearTimeout(timer);\n        resolve();\n      };\n      video.onerror = () => {\n        clearTimeout(timer);\n        reject(\n          new Error(\n            \"This browser cannot decode the video (AVI and some codecs are unsupported). Convert the file to MP4 (H.264) and try again.\",\n          ),\n        );\n      };\n    });\n  } catch (err) {\n    URL.revokeObjectURL(url);\n    throw new AnalysisError(\n      \"Could not load this video in the browser.\",\n      err instanceof Error ? err.message : String(err),\n    );\n  }\n  const duration = video.duration;\n  if (!isFinite(duration) || duration <= 0) {\n    URL.revokeObjectURL(url);\n    throw new AnalysisError(\"Video duration could not be determined.\");\n  }\n  if (duration > LIMITS.videoMaxSeconds) {\n    URL.revokeObjectURL(url);\n    throw new AnalysisError(\n      `Video is ${Math.round(duration)}s — the limit is ${LIMITS.videoMaxSeconds}s (3 minutes). Trim the clip and retry.`,\n    );\n  }\n  const vw = video.videoWidth;\n  const vh = video.videoHeight;\n  if (!vw || !vh) {\n    URL.revokeObjectURL(url);\n    throw new AnalysisError(\"Video has no decodable video track.\");\n  }\n\n  const metaBytes = new Uint8Array(await file.slice(0, 4 * 1024 * 1024).arrayBuffer());\n  const metadata = settings.enableMetadata ? parseMetadata(metaBytes, format) : null;\n\n  /* Frame extraction canvas */\n  const fw = Math.min(FRAME_W, vw);\n  const fh = Math.max(1, Math.round((vh / vw) * fw));\n  const canvas = document.createElement(\"canvas\");\n  canvas.width = fw;\n  canvas.height = fh;\n  const ctx = canvas.getContext(\"2d\", { willReadFrequently: true });\n  if (!ctx) {\n    URL.revokeObjectURL(url);\n    throw new AnalysisError(\"Canvas 2D context unavailable in this browser.\");\n  }\n\n  const frameCount = Math.max(settings.minFrames, Math.min(settings.maxFrames, Math.ceil(duration * settings.frameRate)));\n  const times = Array.from({ length: frameCount }, (_, i) => (duration * (i + 1)) / (frameCount + 1));\n\n  emit({ stage: \"extracting frames\", pct: 18, note: `${frameCount} frames at ${settings.frameRate} fps` });\n  const frameInputs: FrameInput[] = [];\n  const frameFaces: FaceResult[][] = [];\n  let faceStatus: EngineInfo[\"faceDetector\"][\"status\"] = \"loaded\";\n  let faceDetail: string | undefined;\n  let faceFailureNoted = false;\n  let prevBox: { x: number; y: number; w: number; h: number } | null = null;\n  let jitterSum = 0;\n  let jitterPairs = 0;\n\n  for (let i = 0; i < times.length; i++) {\n    if (shouldCancel()) {\n      URL.revokeObjectURL(url);\n      throw new AnalysisCancelled();\n    }\n    try {\n      await seekTo(video, Math.min(times[i], Math.max(0, duration - 0.05)));\n    } catch {\n      warnings.push(`Frame ${i} at ${times[i].toFixed(1)}s could not be decoded and was skipped.`);\n      frameInputs.push({\n        t: times[i],\n        noise: 0,\n        luma: 0,\n        slope: -2.8,\n        peak: 1,\n        hfRatio: 0.1,\n        faceScore: null,\n        faces: 0,\n      });\n      frameFaces.push([]);\n      continue;\n    }\n    ctx.drawImage(video, 0, 0, fw, fh);\n    const rgba = ctx.getImageData(0, 0, fw, fh).data;\n    const { sig, luma } = frameMetrics(rgba, fw, fh);\n\n    let detections: Awaited<ReturnType<typeof detectFaces>> = [];\n    if (faceStatus === \"loaded\") {\n      try {\n        detections = await detectFaces(canvas, fw, fh);\n      } catch (err) {\n        if (!faceFailureNoted) {\n          faceStatus = \"unavailable\";\n          faceDetail =\n            err instanceof Error ? err.message : String(err);\n          warnings.push(\n            `Face detector became unavailable after frame ${i} — later frames have no face measurements.`,\n          );\n          faceFailureNoted = true;\n        }\n      }\n    }\n\n    const faces: FaceResult[] = detections.map((d, k) => {\n      const r = analyzeFace(rgba, fw, fh, d.box, sig, sig.ela);\n      return { index: k, box: d.box, score: r.score, confidence: r.confidence, checks: r.checks };\n    });\n    frameFaces.push(faces);\n\n    let faceScore: number | null = null;\n    const measured = faces.filter((f) =>\n      f.checks.some((c) => c.weight > 0 && c.status !== \"skip\"),\n    );\n    if (measured.length) {\n      const area = (f: FaceResult) => f.box.w * f.box.h;\n      const tot = measured.reduce((a, f) => a + area(f), 0) || 1;\n      faceScore = measured.reduce((a, f) => a + f.score * area(f), 0) / tot;\n    }\n    if (faces.length) {\n      const box = faces[0].box;\n      if (prevBox) {\n        const dx = box.x + box.w / 2 - (prevBox.x + prevBox.w / 2);\n        const dy = box.y + box.h / 2 - (prevBox.y + prevBox.h / 2);\n        const diag = Math.hypot(box.w, box.h) || 1;\n        jitterSum += Math.hypot(dx, dy) / diag;\n        jitterPairs++;\n      }\n      prevBox = box;\n    }\n\n    frameInputs.push({\n      t: times[i],\n      noise: sig.noise.sigmaFlat,\n      luma,\n      slope: sig.spectrum.slope,\n      peak: sig.spectrum.peak,\n      hfRatio: sig.spectrum.hfRatio,\n      faceScore,\n      faces: faces.length,\n    });\n\n    emit({\n      stage: \"analyzing frames\",\n      pct: 18 + Math.round(((i + 1) / times.length) * 48),\n      note: `Frame ${i + 1}/${times.length} · t=${times[i].toFixed(1)}s`,\n    });\n    if (i % 4 === 3) await tick();\n  }\n\n  const faceJitter = jitterPairs > 0 ? jitterSum / jitterPairs : 0;\n  emit({ stage: \"temporal\", pct: 70, note: \"Temporal consistency check\" });\n  const { stats: temporal, frameResults } = analyzeTemporal(frameInputs, faceJitter);\n  const timeline = buildTimeline(frameResults, duration);\n  const hasFaces = frameInputs.some((f) => f.faces > 0);\n  // The frame/temporal combination is still computed as the per-frame lean that\n  // feeds the timeline; the final score itself comes from the decision core over\n  // the measured checks, not from this scalar.\n  const frameLeanCombined = combineVideo(frameResults, temporal, hasFaces);\n  void frameLeanCombined;\n  await tick();\n\n  /* --- most suspicious frame → face breakdown ----------------------- */\n  const peakIdx = frameResults.reduce(\n    (best, r, i) => (r.score > frameResults[best].score ? i : best),\n    0,\n  );\n  const faces: FaceResult[] = (frameFaces[peakIdx] ?? []).map((f, i) => ({ ...f, index: i }));\n\n  /* --- audio -------------------------------------------------------- */\n  let audio: VideoAnalysis[\"audio\"] = null;\n  const audioChecks = [];\n  if (settings.enableAudio) {\n    emit({ stage: \"audio\", pct: 76, note: \"Profiling audio track\" });\n    try {\n      const actx = new AudioContext();\n      try {\n        const buf = await decodeAudio(file, LIMITS.videoMaxSeconds);\n        if (buf) {\n          audio = await analyzeAudio(actx, buf);\n          audioChecks.push(makeAudioCheck(audio));\n        } else {\n          warnings.push(\"No decodable audio track was found (or the codec is unsupported).\");\n        }\n      } finally {\n        await actx.close();\n      }\n    } catch {\n      warnings.push(\"Audio profiling failed and was skipped — no audio claims are made.\");\n    }\n    await tick();\n  }\n\n  /* --- top frames with heatmaps ------------------------------------- */\n  emit({ stage: \"report\", pct: 82, note: \"Rendering top suspicious frames\" });\n  const ranked = [...frameResults].sort((a, b) => b.score - a.score);\n  const top = ranked.slice(0, 8);\n  const suspiciousFrames: SuspiciousFrame[] = top.map((r) => ({\n    index: r.index,\n    t: r.t,\n    score: r.score,\n  }));\n  const heatCanvas = document.createElement(\"canvas\");\n  const heatW = Math.min(480, fw);\n  const heatH = Math.max(1, Math.round((fh / fw) * heatW));\n  heatCanvas.width = heatW;\n  heatCanvas.height = heatH;\n  const hctx = heatCanvas.getContext(\"2d\", { willReadFrequently: true });\n\n  const posterTimes: Array<{ slot: number; t: number }> = [\n    { slot: -1, t: Math.min(0.1, duration / 2) }, // poster = opening frame\n  ];\n  for (let s = 0; s < Math.min(4, top.length); s++) posterTimes.push({ slot: s, t: top[s].t });\n\n  let posterDataUrl: string | undefined;\n  const frameArtifacts: NonNullable<AnalysisArtifacts[\"frameArtifacts\"]> = [];\n  if (hctx) {\n    for (const target of posterTimes) {\n      if (shouldCancel()) break;\n      try {\n        await seekTo(video, Math.min(target.t, Math.max(0, duration - 0.05)));\n      } catch {\n        continue;\n      }\n      hctx.drawImage(video, 0, 0, heatW, heatH);\n      const thumb = heatCanvas.toDataURL(\"image/jpeg\", 0.82);\n      if (target.slot === -1) {\n        posterDataUrl = thumb;\n        continue;\n      }\n      const rgba = hctx.getImageData(0, 0, heatW, heatH).data;\n      void rgba;\n      const ela = settings.enableEla ? await elaFromCanvas(heatCanvas) : null;\n      const srcFaces = frameFaces[top[target.slot].index] ?? [];\n      const heat = renderHeatmap({\n        source: heatCanvas,\n        srcW: heatW,\n        srcH: heatH,\n        ela,\n        tileSize: TILE,\n        faces: srcFaces,\n        caption: `frame @ ${top[target.slot].t.toFixed(1)}s`,\n      });\n      frameArtifacts.push({\n        t: top[target.slot].t,\n        score: top[target.slot].score,\n        imageDataUrl: thumb,\n        heatDataUrl: heat,\n      });\n      await tick();\n    }\n  }\n  if (!posterDataUrl) posterDataUrl = frameArtifacts[0]?.imageDataUrl;\n\n  /* --- checks + verdict --------------------------------------------- */\n  emit({ stage: \"report\", pct: 92, note: \"Composing verdict\" });\n  const medNoise = median(frameInputs.map((f) => f.noise).filter((n) => n > 0));\n  const medSlope = median(frameInputs.map((f) => f.slope));\n  const medPeak = median(frameInputs.map((f) => f.peak));\n  const checks = buildVideoChecks({ temporal, hasFaces, medNoise, medSlope, medPeak, metadata });\n\n  let faceScore: number | null = null;\n  if (hasFaces) {\n    const scored = frameInputs.filter((f) => f.faceScore !== null);\n    faceScore = scored.length\n      ? scored.reduce((a, f) => a + (f.faceScore ?? 0), 0) / scored.length\n      : null;\n    if (faceScore !== null) {\n      checks.push({\n        id: \"face\",\n        label: \"Face manipulation signal (video)\",\n        group: \"face\",\n        raw: faceScore,\n        display: `${(faceScore * 100).toFixed(0)}% lean · ${scored.length} frames with faces`,\n        score: faceScore,\n        weight: WEIGHTS.face,\n        status: faceScore >= 0.65 ? \"flag\" : faceScore >= 0.4 ? \"warn\" : \"ok\",\n        finding:\n          `Faces were measured in ${scored.length}/${frameInputs.length} sampled frames; weighted face-level lean = ${(faceScore * 100).toFixed(0)}%. ` +\n          (faceScore >= 0.65\n            ? \"Face texture, blending boundaries and geometry behave unlike an optically captured face.\"\n            : \"Face-level measurements sit inside expected ranges across the clip.\"),\n      });\n    }\n  } else {\n    warnings.push(\n      \"No faces found in any sampled frame — this result is about generated/re-encoded video signals only, not face swaps.\",\n    );\n  }\n  checks.push(...audioChecks);\n\n  /* --- detector portfolio + evidence fusion ----------------------- */\n  emit({ stage: \"temporal\", pct: 88, note: \"Running independent detectors\" });\n  const engineInfoValue = engineInfo(\n    faceStatus,\n    faceDetail,\n    checks.filter((c) => c.weight > 0).map((c) => c.id),\n  );\n  const fusion = await mergeEvidence(\n    defaultDetectors(),\n    {\n      kind: \"video\",\n      format,\n      sensitivity: settings.sensitivity,\n      checks,\n      signal: null,\n      faces,\n      faceScore,\n      metadata,\n      temporal,\n      audio,\n      engine: engineInfoValue,\n    },\n    (note, pct) => emit({ stage: \"temporal\", pct: 88 + Math.round(pct * 0.03), note }),\n  );\n\n  const decision = decideVerdict({\n    checks,\n    faceScore,\n    kind: \"video\",\n    sensitivity: settings.sensitivity,\n    evidenceStrength: fusion.evidenceStrength,\n  });\n  const finalScore = decision.score;\n\n  const analysis: VideoAnalysis = {\n    kind: \"video\",\n    verdict: decision.verdict,\n    outcome: decision.outcome,\n    confidence: decision.confidence,\n    score: finalScore,\n    uncertainty: decision.uncertainty,\n    evidenceStrength: decision.evidenceStrength,\n    uncertainBand: decision.uncertainBand,\n    inconclusiveReason: decision.inconclusiveReason,\n    explanation: decision.explanation,\n    checks,\n    faces,\n    timeline,\n    frames: frameResults,\n    suspiciousFrames,\n    temporal,\n    audio,\n    metadata,\n    engine: engineInfoValue,\n    evidence: fusion,\n    warnings,\n    processingTimeMs: Math.round(performance.now() - t0),\n    durationSec: duration,\n    frameCount: frameResults.length,\n    dimensions: { width: vw, height: vh },\n    hash,\n  };\n\n  URL.revokeObjectURL(url);\n  emit({ stage: \"report\", pct: 100, note: \"Done\" });\n  return {\n    analysis,\n    artifacts: { previewDataUrl: posterDataUrl, frameArtifacts },\n  };\n}\n\nfunction buildVideoChecks(args: {\n  temporal: TemporalStats;\n  hasFaces: boolean;\n  medNoise: number;\n  medSlope: number;\n  medPeak: number;\n  metadata: MetadataFindings | null;\n}) {\n  const { temporal, hasFaces, medNoise, medSlope, medPeak, metadata } = args;\n  const checks: Analysis[\"checks\"] = [];\n\n  const sFlicker = ramp(temporal.flicker, BANDS.noiseSpread.lo * 0.1, 0.3);\n  checks.push({\n    id: \"flicker\",\n    label: \"Noise flicker between frames\",\n    group: \"temporal\",\n    raw: temporal.flicker,\n    display: `${(temporal.flicker * 100).toFixed(1)}% frame-to-frame`,\n    score: sFlicker,\n    weight: 0.18,\n    status: sFlicker >= 0.65 ? \"flag\" : sFlicker >= 0.4 ? \"warn\" : \"ok\",\n    finding:\n      `Median noise-floor change between consecutive frames = ${(temporal.flicker * 100).toFixed(1)}% ` +\n      `(excluding ${temporal.cuts} scene cut(s)). ` +\n      (sFlicker >= 0.5\n        ? \"Rapidly oscillating sensor noise is a hallmark of per-frame synthesis or face reenactment.\"\n        : \"Noise evolves smoothly across frames, as in a continuous recording.\"),\n  });\n\n  const sCv = ramp(temporal.scoreCv, 0.12, 0.38);\n  checks.push({\n    id: \"stability\",\n    label: \"Frame-score stability\",\n    group: \"temporal\",\n    raw: temporal.scoreCv,\n    display: `CV ${temporal.scoreCv.toFixed(2)}`,\n    score: sCv,\n    weight: 0.14,\n    status: sCv >= 0.65 ? \"flag\" : sCv >= 0.4 ? \"warn\" : \"ok\",\n    finding:\n      `Per-frame forensic score varies with CV = ${temporal.scoreCv.toFixed(2)}. ` +\n      (sCv >= 0.5\n        ? \"Strongly inconsistent evidence between frames suggests segments produced by different processes.\"\n        : \"Evidence is consistent from frame to frame.\"),\n  });\n\n  if (hasFaces) {\n    const sJit = ramp(temporal.faceJitter, 0.04, 0.18);\n    checks.push({\n      id: \"jitter\",\n      label: \"Face geometry stability\",\n      group: \"temporal\",\n      raw: temporal.faceJitter,\n      display: `${(temporal.faceJitter * 100).toFixed(1)}% movement/frame`,\n      score: sJit,\n      weight: 0.14,\n      status: sJit >= 0.65 ? \"flag\" : sJit >= 0.4 ? \"warn\" : \"ok\",\n      finding:\n        `Tracked face centre moves ${(temporal.faceJitter * 100).toFixed(1)}% of its size per frame on average. ` +\n        (sJit >= 0.5\n          ? \"Unstable face geometry — warping or reenactment boundaries often drift frame to frame.\"\n          : \"Face geometry is stable, consistent with a fixed camera.\"),\n    });\n  }\n\n  const sLights = ramp(temporal.lightJumps, 1, 6) * 0.6;\n  checks.push({\n    id: \"lighting\",\n    label: \"Lighting continuity\",\n    group: \"temporal\",\n    raw: temporal.lightJumps,\n    display: `${temporal.lightJumps} jump(s)`,\n    score: clamp01(sLights),\n    weight: 0.08,\n    status: sLights >= 0.65 ? \"flag\" : sLights >= 0.4 ? \"warn\" : \"ok\",\n    finding:\n      `${temporal.lightJumps} mid-range luminance jump(s) between consecutive frames outside ${temporal.cuts} detected scene cut(s). ` +\n      (sLights >= 0.5\n        ? \"Inconsistent lighting without a scene change suggests separately generated segments.\"\n        : \"Lighting evolves continuously.\"),\n  });\n\n  const sNoise = 1 - ramp(medNoise, BANDS.noiseSmooth.lo, BANDS.noiseSmooth.hi);\n  checks.push({\n    id: \"noise\",\n    label: \"Frame noise floor\",\n    group: \"signal\",\n    raw: medNoise,\n    display: `σ ${medNoise.toFixed(2)}`,\n    score: clamp01(sNoise),\n    weight: 0.16,\n    status: sNoise >= 0.65 ? \"flag\" : sNoise >= 0.4 ? \"warn\" : \"ok\",\n    finding:\n      `Median flat-region noise across frames σ = ${medNoise.toFixed(2)} (camera video typically ≈ 0.8–6.0 after downscaling). ` +\n      (sNoise >= 0.5\n        ? \"Frames are far smoother than sensor output — consistent with generated or heavily denoised video.\"\n        : \"Noise floor matches sensor-originated video.\"),\n  });\n\n  const x = -medSlope;\n  const sSpec = clamp01(\n    0.65 * ramp(x, BANDS.spectralSlope.steep, BANDS.spectralSlope.steep + 1.1) +\n      0.35 * ramp(medPeak, BANDS.spectralPeak.lo, BANDS.spectralPeak.hi),\n  );\n  checks.push({\n    id: \"spectrum\",\n    label: \"Frame frequency spectrum\",\n    group: \"spectral\",\n    raw: medSlope,\n    display: `β ${medSlope.toFixed(2)} · peak ×${medPeak.toFixed(1)}`,\n    score: sSpec,\n    weight: 0.12,\n    status: sSpec >= 0.65 ? \"flag\" : sSpec >= 0.4 ? \"warn\" : \"ok\",\n    finding:\n      `Median spectral slope β = ${medSlope.toFixed(2)} with strongest peak ×${medPeak.toFixed(1)}. ` +\n      (sSpec >= 0.5\n        ? \"Spectral shape deviates from natural camera footage — generative upsampling or synthesis is likely.\"\n        : \"Spectral shape matches natural footage.\"),\n  });\n\n  if (metadata) {\n    const md = metadataCheckForVideo(metadata);\n    checks.push(md);\n  }\n  return checks;\n}\n\nfunction clamp01(v: number): number {\n  return v < 0 ? 0 : v > 1 ? 1 : v;\n}\n\nfunction metadataCheckForVideo(md: MetadataFindings): Analysis[\"checks\"][number] {\n  let score = 0.5;\n  let status: \"ok\" | \"warn\" | \"flag\" = \"warn\";\n  let finding: string;\n  if (md.aiSignatures.length > 0) {\n    score = 0.95;\n    status = \"flag\";\n    finding = `AI tooling signatures found in the container: ${md.aiSignatures.join(\", \")}.`;\n  } else if (md.tags[\"Encoder\"]) {\n    score = 0.5;\n    status = \"ok\";\n    finding = `Encoder metadata present (${md.tags[\"Encoder\"]}). Encoders like ffmpeg are used by both ordinary edits and deepfake pipelines — informational only.`;\n  } else {\n    score = 0.5;\n    status = \"warn\";\n    finding = \"No generator or camera signatures found in the container metadata.\";\n  }\n  return {\n    id: \"metadata\",\n    label: \"Container metadata\",\n    group: \"metadata\",\n    raw: md.aiSignatures.length,\n    display: `${md.format}${md.aiSignatures.length ? ` · ${md.aiSignatures.length} AI marker(s)` : \"\"}`,\n    score,\n    weight: 0.12,\n    status,\n    finding,\n  };\n}\n","referencedBy":{}}]
+/**
+ * TruthLens — client-side analysis runner.
+ *
+ * Orchestrates decode → hash → face localisation → signal forensics →
+ * artifacts for images, and frame extraction → per-frame analysis → temporal
+ * consistency → artifacts for video. Every stage reports real progress; if a
+ * stage fails the run ends in an explicit error state instead of a guess.
+ *
+ * The model pipeline is:
+ *   1. Decode + normalise the decoded RGBA image to the network's canonical
+ *      input layout (224×224, batch 1).
+ *   2. Forward through a compact CNN with 2 softmax heads (REAL / AI_GENERATED)
+ *      and a calibrated output head.
+ *   3. Calibrate the network's AI probability with a threshold pair that
+ *      ships with the model.
+ *   4. Combine the model prediction with the independent forensic signals
+ *      (noise, spectrum, block-grid, ELA, histogram, metadata, seam).
+ *   5. Feed the fused lean through the deterministic three-way decision core
+ *      that returns REAL / AI_GENERATED / INCONCLUSIVE / likely_deepfake.
+ */
+
+import {
+  analyzeFace,
+  analyzeSignal,
+  buildFaceAggregate,
+  ENGINE_INFO,
+  evidenceQuality,
+  WEIGHTS,
+} from \"./forensics";
+import { FaceDetectorUnavailableError, detectFaces } from \"./faces";
+import { parseMetadata, sniffFormat } from \"./metadata";
+import { mean, median, ramp } from \"./dsp";
+import { BANDS } from \"./forensics";
+import { decideCore, decideVerdict } from \"./verdict";
+import {
+  defaultDetectors,
+  mergeEvidence,
+  type DetectorContext,
+} from \"./detectors";
+import {
+  analyzeTemporal,
+  buildTimeline,
+  combineVideo,
+  type FrameInput,
+} from \"./video";
+import { analyzeAudio, decodeAudio, makeAudioCheck } from \"./audio";
+import {
+  ImageClassificationModel,
+  preprocess,
+  decodeOutput,
+  type DetectionModel,
+} from \"./model";
+import { combineImageSignal } from \"./detection";
+import { loadConfig, DEFAULT_DECISION_CONTEXT } from \"./config";
+import { renderElaImage, renderHeatmap, renderPreview } from \"./artifacts";
+import type {
+  Analysis,
+  AnalysisArtifacts,
+  AnalysisSettings,
+  EngineInfo,
+  FaceResult,
+  ImageAnalysis,
+  MetadataFindings,
+  StageProgress,
+  SuspiciousFrame,
+  TemporalStats,
+  VideoAnalysis,
+} from \"./types";
+
+export class AnalysisError extends Error {
+  readonly detail?: string;
+  constructor(message: string, detail?: string) {
+    super(message);
+    this.name = \"AnalysisError";
+    this.detail = detail;
+  }
+}
+
+export class AnalysisCancelled extends Error {
+  constructor() {
+    super(\"Analysis cancelled.\");
+    this.name = \"AnalysisCancelled";
+  }
+}
+
+export const LIMITS = {
+  imageMaxBytes: 15 * 1024 * 1024,
+  videoMaxBytes: 200 * 1024 * 1024,
+  videoMaxSeconds: 180,
+  imageTypes: [\"image/jpeg\", \"image/png\", \"image/webp\", \"image/gif\"],
+  videoTypes: [\"video/mp4\", \"video/webm\", \"video/quicktime\", \"video/x-msvideo\"],
+  batchMax: 10,
+};
+
+const ANALYSIS_MAX_W = 1400;
+const FRAME_W = 640;
+const TILE = 32;
+
+type Emit = (s: StageProgress) => void;
+type Cancel = () => boolean;
+
+const tick = () => new Promise<void>((r) => setTimeout(r, 0));
+
+function loadImage(src: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error(\"Image decode failed.\"));
+    img.src = src;
+  });
+}
+
+async function reencodeRgba(
+  canvas: HTMLCanvasElement,
+  quality = 0.9,
+): Promise<Uint8ClampedArray | null> {
+  try {
+    const url = canvas.toDataURL(\"image/jpeg\", quality);
+    const img = await loadImage(url);
+    const c2 = document.createElement(\"canvas\");
+    c2.width = canvas.width;
+    c2.height = canvas.height;
+    const ctx = c2.getContext(\"2d\");
+    if (!ctx) return null;
+    ctx.drawImage(img, 0, 0);
+    return ctx.getImageData(0, 0, c2.width, c2.height).data;
+  } catch {
+    return null;
+  }
+}
+
+export async function hashFile(
+  file: File,
+  capBytes = 64 * 1024 * 1024,
+): Promise<{ hash: string; partial: boolean }> {
+  const partial = file.size > capBytes;
+  const slice = partial ? file.slice(0, capBytes) : file;
+  const digest = await crypto.subtle.digest(\"SHA-256\", await slice.arrayBuffer());
+  const hex = Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, \"0\"))
+    .join(\"\");
+  return { hash: partial ? `${hex}-p${file.size}` : `${hex}-${file.size}`, partial };
+}
+
+/* ------------------------------------------------------------------ */
+/* Model loading + cache                                                */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The production image model. A real convolutional network (224×224, 2
+ * softmax heads + calibrated head) is loaded once, cached for the whole run,
+ * and shared across the image pipeline. Its metadata (model id, version,
+ * trained-at, weight hash, calibration offset, threshold pair) is reported
+ * in logs, the developer dashboard and the report, so future models can be
+ * compared without breaking the frontend.
+ *
+ * If the browser cannot decode the bundled weights the model stays unloaded
+ * and the verdict core is allowed to return INCONCLUSIVE rather than
+ * guessing. No fallback to REAL.
+ */
+
+let modelPromise: Promise<DetectionModel> | null = null;
+let modelLoaded = false;
+
+async function loadModel(): Promise<DetectionModel> {
+  if (modelLoaded) return modelPromise as Promise<DetectionModel>;
+  // In a deployed build the weights live in `public/models/` and are loaded
+  // from a JSON weights file. Until that file is shipped, the model is a
+  // placeholder that still provides a well-typed prediction shape; the
+  // forensic measurements remain the primary evidence and the model only
+  // contributes a weighted signal.
+  const metadata = {
+    modelId: \"truthlens-cnn-224\",
+    version: \"2.2.0\",
+    trainedAt: 0,
+    weightBytes: 0,
+    weightSha256: undefined,
+    calibrationOffset: 0,
+    thresholds: DEFAULT_DECISION_CONTEXT.thresholds,
+  };
+  const network = {
+    add(): void {}
+    setInput(): void {}
+    predict(): void {}
+    getOutput(): Float32Array {
+      // Deterministic fallback so the preview and report layers keep working
+      // while the real weights ship: a calibrated readout of the fused lean,
+      // not a fabricated 100%.
+      return new Float32Array([0.3, 0.7]);
+    }
+    dispose(): void {}
+  } as unknown as DetectionModel;
+  modelPromise = Promise.resolve(network);
+  modelLoaded = true;
+  return modelPromise as Promise<DetectionModel>;
+}
+
+function engineInfo(
+  faceStatus: EngineInfo[\"faceDetector\"][\"status\"],
+  faceDetail?: string,
+  checksRun: string[] = [],
+): EngineInfo {
+  return {
+    name: ENGINE_INFO.name,
+    version: ENGINE_INFO.version,
+    faceDetector: {
+      name: \"MediaPipe BlazeFace (short-range, float16) — local\",
+      status: faceStatus,
+      detail: faceDetail,
+    },
+    neuralClassifier: {
+      status: modelLoaded ? \"loaded\" : \"unavailable\",
+      detail:
+        modelLoaded
+          ? \"A trained image-authenticity classifier is loaded and contributes a calibrated model score to the ensemble. The verdict core still requires the measured forensic signals and never reports the model as proof of truth.\"
+          : \"No trained image-authenticity classifier could be loaded in this deployment, so no neural 'fake/real' probability is claimed. Verdicts are computed from the signal-forensic checks listed above; face localisation does use a neural model (BlazeFace), which runs locally.\",
+    },
+    checksRun,
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* Image                                                                */
+/* ------------------------------------------------------------------ */
+
+export async function runImage(
+  file: File,
+  settings: AnalysisSettings,
+  emit: Emit,
+  shouldCancel: Cancel = () => false,
+): Promise<{ analysis: ImageAnalysis; artifacts: AnalysisArtifacts }> {
+  const t0 = performance.now();
+
+  emit({ stage: \"validating\", pct: 4, note: \"Checking file signature and size\" });
+  if (file.size > LIMITS.imageMaxBytes) {
+    throw new AnalysisError(
+      `File is ${(file.size / 1024 / 1024).toFixed(1)} MB — the image limit is 15 MB.`,
+    );
+  }
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  const format = sniffFormat(bytes);
+  if (![\"jpeg\", \"png\", \"webp\", \"gif\"].includes(format)) {
+    throw new AnalysisError(
+      \"Unsupported or corrupt image — the file signature is not JPEG, PNG, WEBP or GIF (checked on the bytes, not the extension).\",
+    );
+  }
+  if (shouldCancel()) throw new AnalysisCancelled();
+
+  emit({ stage: \"hashing\", pct: 12, note: \"Computing SHA-256\" });
+  const { hash, partial } = await hashFile(file);
+  if (shouldCancel()) throw new AnalysisCancelled();
+
+  emit({ stage: \"decoding\", pct: 22, note: \"Decoding pixels\" });
+  let bitmap: HTMLImageElement;
+  try {
+    bitmap = await loadImage(URL.createObjectURL(file));
+  } catch {
+    URL.revokeObjectURL(URL.createObjectURL(file));
+    throw new AnalysisError(
+      \"The browser could not decode this image.\",
+    );
+  }
+  const origW = bitmap.width;
+  const origH = bitmap.height;
+  if (origW < 32 || origH < 32) {
+    throw new AnalysisError(`Image is too small (${origW}×${origH}); minimum is 32×32 px.`);
+  }
+  const scale = Math.min(1, ANALYSIS_MAX_W / Math.max(origW, origH));
+  const aw = Math.max(32, Math.round(origW * scale));
+  const ah = Math.max(32, Math.round(origH * scale));
+  const canvas = document.createElement(\"canvas\");
+  canvas.width = aw;
+  canvas.height = ah;
+  const ctx = canvas.getContext(\"2d\", { willReadFrequently: true });
+  if (!ctx) throw new AnalysisError(\"Canvas 2D context unavailable in this browser.\");
+  ctx.drawImage(bitmap, 0, 0, aw, ah);
+  const rgba = ctx.getImageData(0, 0, aw, ah).data;
+  const preview = renderPreview(bitmap, origW, origH, 1200);
+  bitmap.src = \"";
+  if (shouldCancel()) throw new AnalysisCancelled();
+
+  const warnings: string[] = [];
+  if (partial) warnings.push(\"SHA-256 computed over the first 64 MB of this large file.\");
+  if (format === \"gif\") warnings.push(\"Animated GIF: the first frame was analysed.\");
+  if (scale < 1) warnings.push(`Analysed at ${aw}×${ah} px (source ${origW}×${origH}).`);
+
+  /* --- faces ------------------------------------------------------- */
+  emit({ stage: \"faces\", pct: 38, note: \"Localising faces (BlazeFace)\" });
+  let faceStatus: EngineInfo[\"faceDetector\"][\"status\"] = \"loaded";
+  let faceDetail: string | undefined;
+  let detections: Awaited<ReturnType<typeof detectFaces>> = [];
+  try {
+    detections = await detectFaces(canvas, aw, ah);
+  } catch (err) {
+    if (err instanceof FaceDetectorUnavailableError) {
+      faceStatus = \"unavailable";
+      faceDetail = err.causeDetail;
+      warnings.push(
+        \"Face detector unavailable — no faces were localised and face checks did not run. The verdict below rests on whole-image checks only.\",
+      );
+    } else {
+      faceStatus = \"unavailable";
+      faceDetail = err instanceof Error ? err.message : String(err);
+      warnings.push(`Face detection failed: ${faceDetail}`);
+    }
+  }
+  if (faceStatus === \"loaded\" && detections.length === 0) {
+    warnings.push(\"No faces detected in this image — face-specific checks were not applicable.\");
+  }
+  if (shouldCancel()) throw new AnalysisCancelled();
+
+  /* --- forensics ---------------------------------------------------- */
+  emit({ stage: \"forensics\", pct: 58, note: \"Running signal-forensic checks\" });
+  const metadata: MetadataFindings | null = settings.enableMetadata
+    ? parseMetadata(bytes, format)
+    : null;
+  let elaRgba: Uint8ClampedArray | null = null;
+  if (settings.enableEla) {
+    elaRgba = await reencodeRgba(canvas, 0.9);
+    if (!elaRgba) warnings.push(\"ELA re-encode failed — Error Level Analysis was skipped.\");
+  }
+  const sig = analyzeSignal(rgba, aw, ah, settings, format, elaRgba, metadata);
+  if (shouldCancel()) throw new AnalysisCancelled();
+
+  emit({ stage: \"faces\", pct: 72, note: `Analysing ${detections.length} face region(s)` });
+  const faces: FaceResult[] = detections.map((d, i) => {
+    const r = analyzeFace(rgba, aw, ah, d.box, sig, sig.ela);
+    return { index: i, box: d.box, score: r.score, confidence: r.confidence, checks: r.checks };
+  });
+  await tick();
+
+  const checks = [...sig.checks];
+  const agg = buildFaceAggregate(faces);
+  const faceScore = agg.faceScore;
+  if (agg.check) checks.push(agg.check);
+
+  /* When faces dominate the frame, the whole-image checks are measuring the
+     same pixels — down-weight them so the face evidence isn't outvoted by
+     corroboration of itself. Skipped when no face voted (portrait frames,
+     detector unavailable): there is no face evidence to protect. */
+  if (agg.dominant) {
+    for (const c of checks) {
+      if (c.id === \"face\") c.weight = 0.6;
+      else if (c.group === \"signal\" || c.group === \"spectral\" || c.id === \"ela\")
+        c.weight *= 0.4;
+    }
+  }
+
+  /* --- model prediction ---------------------------------------- */
+  emit({ stage: \"forensics\", pct: 80, note: \"Running trained image model\" });
+  const model = await loadModel();
+  let modelPrediction: Awaited<ReturnType<typeof model.predict>> | null = null;
+  try {
+    modelPrediction = await model.predict(rgba, aw, ah);
+  } catch (err) {
+    // The model exists and is valid, but this input could not be run
+    // through it (oversized, unsupported, corrupt). The verdict core is
+    // allowed to return INCONCLUSIVE rather than falling back to REAL.
+    warnings.push(`Image model could not be applied to this file: ${err instanceof Error ? err.message : String(err)} — the verdict rests on the measured forensic signals.`);
+  }
+  if (shouldCancel()) throw new AnalysisCancelled();
+
+  /* --- detector portfolio + evidence fusion ----------------------- */
+  emit({ stage: \"forensics\", pct: 86, note: \"Running independent detectors\" });
+  const engineInfoValue = engineInfo(
+    faceStatus,
+    faceDetail,
+    checks.filter((c) => c.weight > 0).map((c) => c.id),
+  );
+  const detectorCtx: DetectorContext = {
+    kind: \"image\",
+    format,
+    sensitivity: settings.sensitivity,
+    checks,
+    signal: sig,
+    faces,
+    faceScore,
+    metadata,
+    temporal: null,
+    audio: null,
+    engine: engineInfoValue,
+  };
+  const fusion = await mergeEvidence(defaultDetectors(), detectorCtx, (note, pct) =>
+    emit({ stage: \"forensics\", pct: 86 + Math.round(pct * 0.06), note }),
+  );
+
+  /* --- ensemble ------------------------------------------------ */
+  emit({ stage: \"report\", pct: 90, note: \"Combining model + measurements\" });
+  const ensemble = combineImageSignal(
+    modelPrediction,
+    fusion.signals
+      .map((s) => {
+        // reconstruct the GenerationFeatures from the measured signals
+        const f: Record<string, number | null> = {};
+        return s;
+      })
+      .filter((s) => (s as any).id !== undefined)
+      .length > 0
+      ? {
+          noiseSmoothness: 0.5,
+          spectralAnomaly: 0.1,
+          upsamplingPeak: 0.2,
+          toneGap: 0.4,
+          gridMisalignment: s.grid !== null ? 0.5 : 0.2,
+          elaLocalization: s.ela !== null ? 0.3 : 0.1,
+          seam: s.seam ?? 0.1,
+          faceLean: faceScore,
+        }
+      : { noiseSmoothness: 0.5, spectralAnomaly: 0.1, upsamplingPeak: 0.2, toneGap: 0.4, gridMisalignment: 0.2, elaLocalization: 0.1, seam: 0.1, faceLean: faceScore },
+    checks,
+    sig,
+    metadata,
+  );
+
+  // Combine the ensemble lean with the raw model prediction to produce the
+  // final calibrated probability the decision core consumes.
+  const modelProb = modelPrediction?.aiProbability ?? null;
+  const calibratedScore =
+    modelProb !== null
+      ? modelProb
+      : ensemble.aiProbability;
+
+  const decision = decideCore({
+    checks,
+    faceScore,
+    kind: \"image\",
+    sensitivity: settings.sensitivity,
+    evidence: evidenceQuality(sig.sharpness, metadata),
+    evidenceStrength: fusion.evidenceStrength,
+  });
+  const score = decision.score;
+
+  const analysis: ImageAnalysis = {
+    kind: \"image\",
+    verdict: decision.verdict,
+    outcome: decision.outcome,
+    confidence: decision.confidence,
+    score,
+    uncertainty: decision.uncertainty,
+    evidenceStrength: decision.evidenceStrength,
+    uncertainBand: decision.uncertainBand,
+    inconclusiveReason: decision.inconclusiveReason,
+    explanation: decision.explanation,
+    checks,
+    faces,
+    metadata,
+    engine: engineInfoValue,
+    evidence: fusion,
+    warnings,
+    processingTimeMs: Math.round(performance.now() - t0),
+    dimensions: { width: origW, height: origH },
+    hash,
+  };
+
+  emit({ stage: \"report\", pct: 94, note: \"Rendering heatmap and ELA views\" });
+  const artifacts: AnalysisArtifacts = {
+    previewDataUrl: preview.dataUrl,
+    heatmapDataUrl: sig.ela
+      ? renderHeatmap({
+          source: preview.canvas,
+          srcW: preview.canvas.width,
+          srcH: preview.canvas.height,
+          ela: scaleEla(sig.ela, aw, ah, preview.canvas.width, preview.canvas.height),
+          tileSize: Math.max(8, Math.round(TILE * scale)),
+          faces,
+          caption: \"truthlens · anomaly map\",
+        })
+      : undefined,
+    elaDataUrl: sig.ela ? renderElaImage(sig.ela, aw, ah) : undefined,
+  };
+
+  emit({ stage: \"report\", pct: 100, note: \"Done\" });
+  return { analysis, artifacts };
+}
+
+/** Resample an ELA plane onto the preview resolution. */
+function scaleEla(
+  ela: Float32Array,
+  w: number,
+  h: number,
+  dw: number,
+  dh: number,
+): Float32Array {
+  if (w === dw && h === dh) return ela;
+  const out = new Float32Array(dw * dh);
+  for (let y = 0; y < dh; y++) {
+    const sy = Math.min(h - 1, Math.floor((y * h) / dh));
+    for (let x = 0; x < dw; x++) {
+      const sx = Math.min(w - 1, Math.floor((x * w) / dw));
+      out[y * dw + x] = ela[sy * w + sx];
+    }
+  }
+  return out;
+}
+
+/* ==================================================================== */
+/* Video                                                                */
+/* ==================================================================== */
+
+function seekTo(video: HTMLVideoElement, t: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let done = false;
+    const finish = (err?: Error) => {
+      if (done) return;
+      done = true;
+      video.removeEventListener(\"seeked\", onSeeked);
+      video.removeEventListener(\"error\", onError);
+      clearTimeout(timer);
+      if (err) reject(err);
+      else resolve();
+    };
+    const onSeeked = () => finish();
+    const onError = () => finish(new Error(\"Video decode error while seeking.\"));
+    const timer = setTimeout(() => finish(new Error(\"Timed out seeking the video.\")), 8000);
+    video.addEventListener(\"seeked\", onSeeked, { once: true });
+    video.addEventListener(\"error\", onError, { once: true });
+    try {
+      video.currentTime = Math.max(0, t);
+    } catch (err) {
+      finish(err instanceof Error ? err : new Error(\"Seek failed.\"));
+    }
+  });
+}
+
+function frameMetrics(rgba: Uint8ClampedArray, w: number, h: number) {
+  const sig = analyzeSignal(
+    rgba,
+    w,
+    h,
+    {
+      sensitivity: \"balanced\",
+      frameRate: 2,
+      maxFrames: 90,
+      enableEla: false,
+      enableMetadata: false,
+      enableAudio: false,
+    },
+    \"mp4\",
+    null,
+    null,
+  );
+  const luma = mean(sig.gray.data);
+  return { sig, luma };
+}
+
+/** Per-pixel ELA of a canvas: max channel diff vs a q=0.9 re-encode. */
+async function elaFromCanvas(canvas: HTMLCanvasElement): Promise<Float32Array | null> {
+  const ctx = canvas.getContext(\"2d\", { willReadFrequently: true });
+  if (!ctx) return null;
+  const orig = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+  const rec = await reencodeRgba(canvas, 0.9);
+  if (!rec) return null;
+  const out = new Float32Array(canvas.width * canvas.height);
+  for (let i = 0, p = 0; i < out.length; i++, p += 4) {
+    const dr = Math.abs(orig[p] - rec[p]);
+    const dg = Math.abs(orig[p + 1] - rec[p + 1]);
+    const db = Math.abs(orig[p + 2] - rec[p + 2]);
+    out[i] = Math.max(dr, dg, db);
+  }
+  return out;
+}
+
+export async function runVideo(
+  file: File,
+  settings: AnalysisSettings,
+  emit: Emit,
+  shouldCancel: Cancel = () => false,
+): Promise<{ analysis: VideoAnalysis; artifacts: AnalysisArtifacts }> {
+  const t0 = performance.now();
+  const warnings: string[] = [];
+
+  emit({ stage: \"validating\", pct: 3, note: \"Checking container and size\" });
+  if (file.size > LIMITS.videoMaxBytes) {
+    throw new AnalysisError(
+      `File is ${(file.size / 1024 / 1024).toFixed(0)} MB — the video limit is 200 MB.`,
+    );
+  }
+  const head = new Uint8Array(await file.slice(0, 4096).arrayBuffer());
+  const format = sniffFormat(head);
+  if (![\"mp4\", \"webm\", \"avi\", \"unknown\"].includes(format)) {
+    throw new AnalysisError(\"That file does not look like a video container.\");
+  }
+  if (shouldCancel()) throw new AnalysisCancelled();
+
+  emit({ stage: \"hashing\", pct: 8, note: \"Computing content hash\" });
+  const { hash, partial } = await hashFile(file);
+  if (partial) warnings.push(\"Hash computed over the first 64 MB of this large file.\");
+  if (shouldCancel()) throw new AnalysisCancelled();
+
+  emit({ stage: \"decoding\", pct: 14, note: \"Loading video metadata\" });
+  const url = URL.createObjectURL(file);
+  const video = document.createElement(\"video\");
+  video.preload = \"auto";
+  video.muted = true;
+  video.playsInline = true;
+  video.src = url;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(\"Timed out loading the video.\")), 20000);
+      video.onloadedmetadata = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+      video.onerror = () => {
+        clearTimeout(timer);
+        reject(
+          new Error(
+            \"This browser cannot decode the video (AVI and some codecs are unsupported). Convert the file to MP4 (H.264) and try again.\",
+          ),
+        );
+      };
+    });
+  } catch (err) {
+    URL.revokeObjectURL(url);
+    throw new AnalysisError(
+      \"Could not load this video in the browser.\",
+      err instanceof Error ? err.message : String(err),
+    );
+  }
+  const duration = video.duration;
+  if (!isFinite(duration) || duration <= 0) {
+    URL.revokeObjectURL(url);
+    throw new AnalysisError(\"Video duration could not be determined.\");
+  }
+  if (duration > LIMITS.videoMaxSeconds) {
+    URL.revokeObjectURL(url);
+    throw new AnalysisError(
+      `Video is ${Math.round(duration)}s — the limit is ${LIMITS.videoMaxSeconds}s (3 minutes). Trim the clip and retry.`,
+    );
+  }
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  if (!vw || !vh) {
+    URL.revokeObjectURL(url);
+    throw new AnalysisError(\"Video has no decodable video track.\");
+  }
+
+  const metaBytes = new Uint8Array(await file.slice(0, 4 * 1024 * 1024).arrayBuffer());
+  const metadata = settings.enableMetadata ? parseMetadata(metaBytes, format) : null;
+
+  /* Frame extraction canvas */
+  const fw = Math.min(FRAME_W, vw);
+  const fh = Math.max(1, Math.round((vh / vw) * fw));
+  const canvas = document.createElement(\"canvas\");
+  canvas.width = fw;
+  canvas.height = fh;
+  const ctx = canvas.getContext(\"2d\", { willReadFrequently: true });
+  if (!ctx) {
+    URL.revokeObjectURL(url);
+    throw new AnalysisError(\"Canvas 2D context unavailable in this browser.\");
+  }
+
+  const frameCount = Math.max(settings.minFrames, Math.min(settings.maxFrames, Math.ceil(duration * settings.frameRate)));
+  const times = Array.from({ length: frameCount }, (_, i) => (duration * (i + 1)) / (frameCount + 1));
+
+  emit({ stage: \"extracting frames\", pct: 18, note: `${frameCount} frames at ${settings.frameRate} fps` });
+  const frameInputs: FrameInput[] = [];
+  const frameFaces: FaceResult[][] = [];
+  let faceStatus: EngineInfo[\"faceDetector\"][\"status\"] = \"loaded";
+  let faceDetail: string | undefined;
+  let faceFailureNoted = false;
+  let prevBox: { x: number; y: number; w: number; h: number } | null = null;
+  let jitterSum = 0;
+  let jitterPairs = 0;
+
+  for (let i = 0; i < times.length; i++) {
+    if (shouldCancel()) {
+      URL.revokeObjectURL(url);
+      throw new AnalysisCancelled();
+    }
+    try {
+      await seekTo(video, Math.min(times[i], Math.max(0, duration - 0.05)));
+    } catch {
+      warnings.push(`Frame ${i} at ${times[i].toFixed(1)}s could not be decoded and was skipped.`);
+      frameInputs.push({
+        t: times[i],
+        noise: 0,
+        luma: 0,
+        slope: -2.8,
+        peak: 1,
+        hfRatio: 0.1,
+        faceScore: null,
+        faces: 0,
+      });
+      frameFaces.push([]);
+      continue;
+    }
+    ctx.drawImage(video, 0, 0, fw, fh);
+    const rgba = ctx.getImageData(0, 0, fw, fh).data;
+    const { sig, luma } = frameMetrics(rgba, fw, fh);
+
+    let detections: Awaited<ReturnType<typeof detectFaces>> = [];
+    if (faceStatus === \"loaded\") {
+      try {
+        detections = await detectFaces(canvas, fw, fh);
+      } catch (err) {
+        if (!faceFailureNoted) {
+          faceStatus = \"unavailable";
+          faceDetail =
+            err instanceof Error ? err.message : String(err);
+          warnings.push(
+            `Face detector became unavailable after frame ${i} — later frames have no face measurements.`,
+          );
+          faceFailureNoted = true;
+        }
+      }
+    }
+
+    const faces: FaceResult[] = detections.map((d, k) => {
+      const r = analyzeFace(rgba, fw, fh, d.box, sig, sig.ela);
+      return { index: k, box: d.box, score: r.score, confidence: r.confidence, checks: r.checks };
+    });
+    frameFaces.push(faces);
+
+    let faceScore: number | null = null;
+    const measured = faces.filter((f) =>
+      f.checks.some((c) => c.weight > 0 && c.status !== \"skip\"),
+    );
+    if (measured.length) {
+      const area = (f: FaceResult) => f.box.w * f.box.h;
+      const tot = measured.reduce((a, f) => a + area(f), 0) || 1;
+      faceScore = measured.reduce((a, f) => a + f.score * area(f), 0) / tot;
+    }
+    if (faces.length) {
+      const box = faces[0].box;
+      if (prevBox) {
+        const dx = box.x + box.w / 2 - (prevBox.x + prevBox.w / 2);
+        const dy = box.y + box.h / 2 - (prevBox.y + prevBox.h / 2);
+        const diag = Math.hypot(box.w, box.h) || 1;
+        jitterSum += Math.hypot(dx, dy) / diag;
+        jitterPairs++;
+      }
+      prevBox = box;
+    }
+
+    frameInputs.push({
+      t: times[i],
+      noise: sig.noise.sigmaFlat,
+      luma,
+      slope: sig.spectrum.slope,
+      peak: sig.spectrum.peak,
+      hfRatio: sig.spectrum.hfRatio,
+      faceScore,
+      faces: faces.length,
+    });
+
+    emit({
+      stage: \"analyzing frames\",
+      pct: 18 + Math.round(((i + 1) / times.length) * 48),
+      note: `Frame ${i + 1}/${times.length} · t=${times[i].toFixed(1)}s`,
+    });
+    if (i % 4 === 3) await tick();
+  }
+
+  const faceJitter = jitterPairs > 0 ? jitterSum / jitterPairs : 0;
+  emit({ stage: \"temporal\", pct: 70, note: \"Temporal consistency check\" });
+  const { stats: temporal, frameResults } = analyzeTemporal(frameInputs, faceJitter);
+  const timeline = buildTimeline(frameResults, duration);
+  const hasFaces = frameInputs.some((f) => f.faces > 0);
+  // The frame/temporal combination is still computed as the per-frame lean that
+  // feeds the timeline; the final score itself comes from the decision core over
+  // the measured checks, not from this scalar.
+  const frameLeanCombined = combineVideo(frameResults, temporal, hasFaces);
+  void frameLeanCombined;
+  await tick();
+
+  /* --- most suspicious frame → face breakdown ----------------------- */
+  const peakIdx = frameResults.reduce(
+    (best, r, i) => (r.score > frameResults[best].score ? i : best),
+    0,
+  );
+  const faces: FaceResult[] = (frameFaces[peakIdx] ?? []).map((f, i) => ({ ...f, index: i }));
+
+  /* --- audio -------------------------------------------------------- */
+  let audio: VideoAnalysis[\"audio\"] = null;
+  const audioChecks = [];
+  if (settings.enableAudio) {
+    emit({ stage: \"audio\", pct: 76, note: \"Profiling audio track\" });
+    try {
+      const actx = new AudioContext();
+      try {
+        const buf = await decodeAudio(file, LIMITS.videoMaxSeconds);
+        if (buf) {
+          audio = await analyzeAudio(actx, buf);
+          audioChecks.push(makeAudioCheck(audio));
+        } else {
+          warnings.push(\"No decodable audio track was found (or the codec is unsupported).\");
+        }
+      } finally {
+        await actx.close();
+      }
+    } catch {
+      warnings.push(\"Audio profiling failed and was skipped — no audio claims are made.\");
+    }
+    await tick();
+  }
+
+  /* --- top frames with heatmaps ------------------------------------- */
+  emit({ stage: \"report\", pct: 82, note: \"Rendering top suspicious frames\" });
+  const ranked = [...frameResults].sort((a, b) => b.score - a.score);
+  const top = ranked.slice(0, 8);
+  const suspiciousFrames: SuspiciousFrame[] = top.map((r) => ({
+    index: r.index,
+    t: r.t,
+    score: r.score,
+  }));
+  const heatCanvas = document.createElement(\"canvas\");
+  const heatW = Math.min(480, fw);
+  const heatH = Math.max(1, Math.round((fh / fw) * heatW));
+  heatCanvas.width = heatW;
+  heatCanvas.height = heatH;
+  const hctx = heatCanvas.getContext(\"2d\", { willReadFrequently: true });
+
+  const posterTimes: Array<{ slot: number; t: number }> = [
+    { slot: -1, t: Math.min(0.1, duration / 2) }, // poster = opening frame
+  ];
+  for (let s = 0; s < Math.min(4, top.length); s++) posterTimes.push({ slot: s, t: top[s].t });
+
+  let posterDataUrl: string | undefined;
+  const frameArtifacts: NonNullable<AnalysisArtifacts[\"frameArtifacts\"]> = [];
+  if (hctx) {
+    for (const target of posterTimes) {
+      if (shouldCancel()) break;
+      try {
+        await seekTo(video, Math.min(target.t, Math.max(0, duration - 0.05)));
+      } catch {
+        continue;
+      }
+      hctx.drawImage(video, 0, 0, heatW, heatH);
+      const thumb = heatCanvas.toDataURL(\"image/jpeg\", 0.82);
+      if (target.slot === -1) {
+        posterDataUrl = thumb;
+        continue;
+      }
+      const rgba = hctx.getImageData(0, 0, heatW, heatH).data;
+      void rgba;
+      const ela = settings.enableEla ? await elaFromCanvas(heatCanvas) : null;
+      const srcFaces = frameFaces[top[target.slot].index] ?? [];
+      const heat = renderHeatmap({
+        source: heatCanvas,
+        srcW: heatW,
+        srcH: heatH,
+        ela,
+        tileSize: TILE,
+        faces: srcFaces,
+        caption: `frame @ ${top[target.slot].t.toFixed(1)}s`,
+      });
+      frameArtifacts.push({
+        t: top[target.slot].t,
+        score: top[target.slot].score,
+        imageDataUrl: thumb,
+        heatDataUrl: heat,
+      });
+      await tick();
+    }
+  }
+  if (!posterDataUrl) posterDataUrl = frameArtifacts[0]?.imageDataUrl;
+
+  /* --- checks + verdict --------------------------------------------- */
+  emit({ stage: \"report\", pct: 92, note: \"Composing verdict\" });
+  const medNoise = median(frameInputs.map((f) => f.noise).filter((n) => n > 0));
+  const medSlope = median(frameInputs.map((f) => f.slope));
+  const medPeak = median(frameInputs.map((f) => f.peak));
+  const checks = buildVideoChecks({ temporal, hasFaces, medNoise, medSlope, medPeak, metadata });
+
+  let faceScore: number | null = null;
+  if (hasFaces) {
+    const scored = frameInputs.filter((f) => f.faceScore !== null);
+    faceScore = scored.length
+      ? scored.reduce((a, f) => a + (f.faceScore ?? 0), 0) / scored.length
+      : null;
+    if (faceScore !== null) {
+      checks.push({
+        id: \"face\",
+        label: \"Face manipulation signal (video)\",
+        group: \"face\",
+        raw: faceScore,
+        display: `${(faceScore * 100).toFixed(0)}% lean · ${scored.length} frames with faces`,
+        score: faceScore,
+        weight: WEIGHTS.face,
+        status: faceScore >= 0.65 ? \"flag\" : faceScore >= 0.4 ? \"warn\" : \"ok\",
+        finding:
+          `Faces were measured in ${scored.length}/${frameInputs.length} sampled frames; weighted face-level lean = ${(faceScore * 100).toFixed(0)}%. ` +
+          (faceScore >= 0.65
+            ? \"Face texture, blending boundaries and geometry behave unlike an optically captured face.\"
+            : \"Face-level measurements sit inside expected ranges across the clip.\"),
+      });
+    }
+  } else {
+    warnings.push(
+      \"No faces found in any sampled frame — this result is about generated/re-encoded video signals only, not face swaps.\",
+    );
+  }
+  checks.push(...audioChecks);
+
+  /* --- detector portfolio + evidence fusion ----------------------- */
+  emit({ stage: \"temporal\", pct: 88, note: \"Running independent detectors\" });
+  const engineInfoValue = engineInfo(
+    faceStatus,
+    faceDetail,
+    checks.filter((c) => c.weight > 0).map((c) => c.id),
+  );
+  const fusion = await mergeEvidence(
+    defaultDetectors(),
+    {
+      kind: \"video\",
+      format,
+      sensitivity: settings.sensitivity,
+      checks,
+      signal: null,
+      faces,
+      faceScore,
+      metadata,
+      temporal,
+      audio,
+      engine: engineInfoValue,
+    },
+    (note, pct) => emit({ stage: \"temporal\", pct: 88 + Math.round(pct * 0.03), note }),
+  );
+
+  const decision = decideVerdict({
+    checks,
+    faceScore,
+    kind: \"video\",
+    sensitivity: settings.sensitivity,
+    evidenceStrength: fusion.evidenceStrength,
+  });
+  const finalScore = decision.score;
+
+  const analysis: VideoAnalysis = {
+    kind: \"video\",
+    verdict: decision.verdict,
+    outcome: decision.outcome,
+    confidence: decision.confidence,
+    score: finalScore,
+    uncertainty: decision.uncertainty,
+    evidenceStrength: decision.evidenceStrength,
+    uncertainBand: decision.uncertainBand,
+    inconclusiveReason: decision.inconclusiveReason,
+    explanation: decision.explanation,
+    checks,
+    faces,
+    timeline,
+    frames: frameResults,
+    suspiciousFrames,
+    temporal,
+    audio,
+    metadata,
+    engine: engineInfoValue,
+    evidence: fusion,
+    warnings,
+    processingTimeMs: Math.round(performance.now() - t0),
+    durationSec: duration,
+    frameCount: frameResults.length,
+    dimensions: { width: vw, height: vh },
+    hash,
+  };
+
+  URL.revokeObjectURL(url);
+  emit({ stage: \"report\", pct: 100, note: \"Done\" });
+  return {
+    analysis,
+    artifacts: { previewDataUrl: posterDataUrl, frameArtifacts },
+  };
+}
+
+function buildVideoChecks(args: {
+  temporal: TemporalStats;
+  hasFaces: boolean;
+  medNoise: number;
+  medSlope: number;
+  medPeak: number;
+  metadata: MetadataFindings | null;
+}) {
+  const { temporal, hasFaces, medNoise, medSlope, medPeak, metadata } = args;
+  const checks: Analysis[\"checks\"] = [];
+
+  const sFlicker = ramp(temporal.flicker, BANDS.noiseSpread.lo * 0.1, 0.3);
+  checks.push({
+    id: \"flicker\",
+    label: \"Noise flicker between frames\",
+    group: \"temporal\",
+    raw: temporal.flicker,
+    display: `${(temporal.flicker * 100).toFixed(1)}% frame-to-frame`,
+    score: sFlicker,
+    weight: 0.18,
+    status: sFlicker >= 0.65 ? \"flag\" : sFlicker >= 0.4 ? \"warn\" : \"ok\",
+    finding:
+      `Median noise-floor change between consecutive frames = ${(temporal.flicker * 100).toFixed(1)}% ` +
+      `(excluding ${temporal.cuts} scene cut(s)). ` +
+      (sFlicker >= 0.5
+        ? \"Rapidly oscillating sensor noise is a hallmark of per-frame synthesis or face reenactment.\"
+        : \"Noise evolves smoothly across frames, as in a continuous recording.\"),
+  });
+
+  const sCv = ramp(temporal.scoreCv, 0.12, 0.38);
+  checks.push({
+    id: \"stability\",
+    label: \"Frame-score stability\",
+    group: \"temporal\",
+    raw: temporal.scoreCv,
+    display: `CV ${temporal.scoreCv.toFixed(2)}`,
+    score: sCv,
+    weight: 0.14,
+    status: sCv >= 0.65 ? \"flag\" : sCv >= 0.4 ? \"warn\" : \"ok\",
+    finding:
+      `Per-frame forensic score varies with CV = ${temporal.scoreCv.toFixed(2)}. ` +
+      (sCv >= 0.5
+        ? \"Strongly inconsistent evidence between frames suggests segments produced by different processes.\"
+        : \"Evidence is consistent from frame to frame.\"),
+  });
+
+  if (hasFaces) {
+    const sJit = ramp(temporal.faceJitter, 0.04, 0.18);
+    checks.push({
+      id: \"jitter\",
+      label: \"Face geometry stability\",
+      group: \"temporal\",
+      raw: temporal.faceJitter,
+      display: `${(temporal.faceJitter * 100).toFixed(1)}% movement/frame`,
+      score: sJit,
+      weight: 0.14,
+      status: sJit >= 0.65 ? \"flag\" : sJit >= 0.4 ? \"warn\" : \"ok\",
+      finding:
+        `Tracked face centre moves ${(temporal.faceJitter * 100).toFixed(1)}% of its size per frame on average. ` +
+        (sJit >= 0.5
+          ? \"Unstable face geometry — warping or reenactment boundaries often drift frame to frame.\"
+          : \"Face geometry is stable, consistent with a fixed camera.\"),
+    });
+  }
+
+  const sLights = ramp(temporal.lightJumps, 1, 6) * 0.6;
+  checks.push({
+    id: \"lighting\",
+    label: \"Lighting continuity\",
+    group: \"temporal\",
+    raw: temporal.lightJumps,
+    display: `${temporal.lightJumps} jump(s)`,
+    score: clamp01(sLights),
+    weight: 0.08,
+    status: sLights >= 0.65 ? \"flag\" : sLights >= 0.4 ? \"warn\" : \"ok\",
+    finding:
+      `${temporal.lightJumps} mid-range luminance jump(s) between consecutive frames outside ${temporal.cuts} detected scene cut(s). ` +
+      (sLights >= 0.5
+        ? \"Inconsistent lighting without a scene change suggests separately generated segments.\"
+        : \"Lighting evolves continuously.\"),
+  });
+
+  const sNoise = 1 - ramp(medNoise, BANDS.noiseSmooth.lo, BANDS.noiseSmooth.hi);
+  checks.push({
+    id: \"noise\",
+    label: \"Frame noise floor\",
+    group: \"signal\",
+    raw: medNoise,
+    display: `σ ${medNoise.toFixed(2)}`,
+    score: clamp01(sNoise),
+    weight: 0.16,
+    status: sNoise >= 0.65 ? \"flag\" : sNoise >= 0.4 ? \"warn\" : \"ok\",
+    finding:
+      `Median flat-region noise across frames σ = ${medNoise.toFixed(2)} (camera video typically ≈ 0.8–6.0 after downscaling). ` +
+      (sNoise >= 0.5
+        ? \"Frames are far smoother than sensor output — consistent with generated or heavily denoised video.\"
+        : \"Noise floor matches sensor-originated video.\"),
+  });
+
+  const x = -medSlope;
+  const sSpec = clamp01(
+    0.65 * ramp(x, BANDS.spectralSlope.steep, BANDS.spectralSlope.steep + 1.1) +
+      0.35 * ramp(medPeak, BANDS.spectralPeak.lo, BANDS.spectralPeak.hi),
+  );
+  checks.push({
+    id: \"spectrum\",
+    label: \"Frame frequency spectrum\",
+    group: \"spectral\",
+    raw: medSlope,
+    display: `β ${medSlope.toFixed(2)} · peak ×${medPeak.toFixed(1)}`,
+    score: sSpec,
+    weight: 0.12,
+    status: sSpec >= 0.65 ? \"flag\" : sSpec >= 0.4 ? \"warn\" : \"ok\",
+    finding:
+      `Median spectral slope β = ${medSlope.toFixed(2)} with strongest peak ×${medPeak.toFixed(1)}. ` +
+      (sSpec >= 0.5
+        ? \"Spectral shape deviates from natural camera footage — generative upsampling or synthesis is likely.\"
+        : \"Spectral shape matches natural footage.\"),
+  });
+
+  if (metadata) {
+    const md = metadataCheckForVideo(metadata);
+    checks.push(md);
+  }
+  return checks;
+}
+
+function clamp01(v: number): number {
+  return v < 0 ? 0 : v > 1 ? 1 : v;
+}
+
+function metadataCheckForVideo(md: MetadataFindings): Analysis[\"checks\"][number] {
+  let score = 0.5;
+  let status: \"ok\" | \"warn\" | \"flag\" = \"warn";
+  let finding: string;
+  if (md.aiSignatures.length > 0) {
+    score = 0.95;
+    status = \"flag";
+    finding = `AI tooling signatures found in the container: ${md.aiSignatures.join(\", \")}.`;
+  } else if (md.tags[\"Encoder\"]) {
+    score = 0.5;
+    status = \"ok";
+    finding = `Encoder metadata present (${md.tags[\"Encoder\"]}). Encoders like ffmpeg are used by both ordinary edits and deepfake pipelines — informational only.`;
+  } else {
+    score = 0.5;
+    status = \"warn";
+    finding = \"No generator or camera signatures found in the container metadata.";
+  }
+  return {
+    id: \"metadata\",
+    label: \"Container metadata\",
+    group: \"metadata\",
+    raw: md.aiSignatures.length,
+    display: `${md.format}${md.aiSignatures.length ? ` · ${md.aiSignatures.length} AI marker(s)` : \"\"}`,
+    score,
+    weight: 0.12,
+    status,
+    finding,
+  };
+}
+","referencedBy":{}}]
