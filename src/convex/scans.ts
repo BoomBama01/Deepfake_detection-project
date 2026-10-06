@@ -1,6 +1,8 @@
 import { v } from "convex/values";
-import { query, mutation } from "./_generated/server";
+import { query, mutation, type ActionCtx } from "./_generated/server";
+import { getAuthUserId } from "@convex-dev/auth/server";
 import { auth } from "./auth";
+import { verdictValidator } from "./schema";
 
 export const scans = {
   add: mutation({
@@ -12,14 +14,16 @@ export const scans = {
       fileName: v.string(),
       fileHash: v.optional(v.string()),
       fileSize: v.optional(v.number()),
-      verdict: v.optional(v.string()),
+      verdict: v.optional(verdictValidator),
       confidence: v.optional(v.number()),
       settings: v.string(),
       resultJson: v.optional(v.string()),
       isPublic: v.optional(v.boolean()),
     },
     handler: async (ctx, args) => {
-      const userId = await auth.verifyClientId(ctx, args.userId);
+      const userId = (await getAuthUserId(ctx)) as any;
+      if (!userId) throw new Error("Sign in first.");
+      if (args.userId && args.userId !== userId) throw new Error("Not your scan.");
       const now = Math.floor(Date.now() / 1000);
       const expiresAt = now + 60 * 60 * 24 * 30;
       const doc = {
@@ -30,6 +34,7 @@ export const scans = {
         fileName: args.fileName,
         fileHash: args.fileHash,
         fileSize: args.fileSize,
+        status: "done",
         verdict: args.verdict,
         confidence: args.confidence,
         settings: args.settings,
@@ -59,7 +64,7 @@ export const scans = {
     handler: (ctx) =>
       ctx.db
         .query("scans")
-        .withIndex("by_created", (q) => q.eq("isPublic", true))
+        .filter((q) => q.eq(q.field("isPublic"), true))
         .order("desc")
         .take(20),
   }),
