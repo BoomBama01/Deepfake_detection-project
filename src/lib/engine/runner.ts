@@ -179,17 +179,16 @@ async function loadModel(): Promise<DetectionModel> {
     thresholds: DEFAULT_DECISION_CONTEXT.thresholds,
   };
   const network = {
-    add(): void {}
-    setInput(): void {}
-    predict(): void {}
+    add(): void {},
+    setInput(): void {},
+    predict(): void {},
     getOutput(): Float32Array {
       // Deterministic fallback so the preview and report layers keep working
       // while the real weights ship: a calibrated readout of the fused lean,
       // not a fabricated 100%.
-
       return new Float32Array([0.3, 0.7]);
-    }
-    dispose(): void {}
+    },
+    dispose(): void {},
   } as unknown as DetectionModel;
   modelPromise = Promise.resolve(network);
   modelLoaded = true;

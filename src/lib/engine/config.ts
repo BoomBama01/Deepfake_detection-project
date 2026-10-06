@@ -83,7 +83,22 @@ export const REPORT_MUST_FLAG_LOW_CONFIDENCE = true;
  * All values are 0..1. Anything malformed falls back to the documented
  * defaults instead of crashing or guessing.
  */
-export function loadConfig(env: NodeJS.ProcessEnv = process.env): {
+export interface LoadConfigEnv {
+  REAL_THRESHOLD?: string;
+  AI_THRESHOLD?: string;
+  REAL_THRESHOLD_LOW?: string;
+  AI_THRESHOLD_LOW?: string;
+  REAL_THRESHOLD_BALANCED?: string;
+  AI_THRESHOLD_BALANCED?: string;
+  INCONCLUSIVE_BAND_LO?: string;
+  INCLOSIVE_BAND_HI?: string;
+  CONSERVATIVE_EVIDENCE_MIN?: string;
+  CONFIDENCE_CAP?: string;
+}
+
+export function loadConfig(
+  env: NodeJS.ProcessEnv = process.env,
+): {
   thresholds: Record<Sensitivity, Thresholds>;
   inconclusiveBand: typeof INCONCLUSIVE_BAND;
   evidenceMin: number;
@@ -127,7 +142,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): {
     confidenceCap: num(env.CONFIDENCE_CAP, CONFIDENCE_CAP),
   };
 }
-
 /**
  * The single threshold profile the production decision core uses. Hardening
  * for the public deployment: a fixed, conservative pair (balanced) so a
@@ -144,4 +158,3 @@ export const DEFAULT_DECISION_CONTEXT = {
   evidenceMin: EVIDENCE_STRENGTH_MIN,
   confidenceCap: CONFIDENCE_CAP,
 };
-","referencedBy":{}}]
