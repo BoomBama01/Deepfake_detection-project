@@ -152,9 +152,9 @@ function topDrivers(aiProbability: number): Array<{ feature: string; value: numb
 function clamp01(v: number): number { return Math.max(0, Math.min(1, v)); }
 
 export class NeuralNetworkClassifierBackend {
-  readonly id = "truthlens-cnn-224";
-  readonly version = "2.2.0";
-  readonly modelBacked = true;
+  private readonly id: string = "truthlens-cnn-224";
+  private readonly version: string = "2.2.0";
+  private readonly modelBacked: boolean = true;
 
   constructor(private network: NeuralNetwork, private offset: number, private metadata: ModelMetadata) {}
 
@@ -164,7 +164,7 @@ export class NeuralNetworkClassifierBackend {
 }
 
 export class ImageClassificationModel {
-  readonly metadata: ModelMetadata;
+  private readonly metadata: ModelMetadata;
 
   constructor(metadata: ModelMetadata, private network: NeuralNetwork) { this.metadata = metadata; }
 

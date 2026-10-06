@@ -1,9 +1,9 @@
 // detection.ts
 import { clamp, stdDev } from "./dsp";
-import { EVIDENCE, type Check, type MetadataFindings } from "./forensics";
+import { EVIDENCE, type Check, type MetadataFindings, type SignalAnalysis } from "./forensics";
 import { PRODUCTION_THRESHOLDS } from "./config";
 import type { GenerationFeatures } from "./model";
-import type { SignalAnalysis } from "./types";
+import type { SignalAnalysis as SignalAnalysisType } from "./types";
 
 export const MODEL_WEIGHT = 0.55;
 export const MEASUREMENT_WEIGHT = 0.45;
@@ -18,7 +18,7 @@ export interface EnsembleResult {
   modelMetadata: { modelId: string; version: string; trainedAt: number; weightBytes: number; weightSha256?: string; calibrationOffset: number; thresholds: { real: number; fake: number }; };
 }
 
-export function combineImageSignal(model: any, features: GenerationFeatures, checks: Check[], signal: SignalAnalysis | null, metadata: MetadataFindings | null, thresholds: { real: number; fake: number } = PRODUCTION_THRESHOLDS): EnsembleResult {
+export function combineImageSignal(model: any, features: GenerationFeatures, checks: Check[], signal: SignalAnalysisType | null, metadata: MetadataFindings | null, thresholds: { real: number; fake: number } = PRODUCTION_THRESHOLDS): EnsembleResult {
   const m = model ?? null;
   const mProb = m ? m.aiProbability : null;
 
@@ -66,7 +66,7 @@ export function combineImageSignal(model: any, features: GenerationFeatures, che
   };
 }
 
-export function leanFromChecks(checks: Check[], signal: SignalAnalysis | null, metadata: MetadataFindings | null): number {
+export function leanFromChecks(checks: Check[], signal: SignalAnalysisType | null, metadata: MetadataFindings | null): number {
   const active = checks.filter(c => c.weight > 0 && c.status !== "skip");
   if (active.length === 0) return 0.5;
   const wsum = active.reduce((a, c) => a + c.weight, 0) || 1;

@@ -101,11 +101,11 @@ export function auditStart(requestId: string, caller: string, kind: MediaKind, f
 }
 
 export function auditComplete(entry: Omit<AuditLog, "ts"> & { elapsedMs: number }): void {
-  auditLog({ ts: Date.now(), ...entry });
+  auditLog({ ts: Date.now(), elapsedMs: entry.elapsedMs, ...entry });
 }
 
 export function auditError(requestId: string, caller: string, kind: MediaKind, stage: string, error: string, fileSize: number = 0, fileName: string = "", contentType: string = "unknown"): void {
-  auditLog({ requestId, caller, kind, fileName, fileSize, contentType, verdict: "error", stage, error, ts: Date.now() });
+  auditLog({ requestId, caller, kind, fileName, fileSize, contentType, verdict: "error", stage, error, elapsedMs: 0, ts: Date.now() });
 }
 
 export function auditLog(entry: AuditLog): void {
