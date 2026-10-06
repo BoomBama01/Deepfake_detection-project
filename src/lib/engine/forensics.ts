@@ -1246,3 +1246,12 @@ export function combineChecks(checks: Check[]): number {
   if (wsum <= 0) return 0.5;
   return clamp(active.reduce((a, c) => a + c.score * c.weight, 0) / wsum, 0, 1);
 }
+
+// EVIDENCE gains a runtime `degraded` flag so detection-layer code can read
+// it without touching the immutable band limits. The band limits themselves
+// stay `as const`; this member is computed-only and never serialised.
+export const EVIDENCE_STATE = {
+  heavyJpegQf: EVIDENCE.heavyJpegQf,
+  minSharpness: EVIDENCE.minSharpness,
+  degraded: false,
+} as const;
