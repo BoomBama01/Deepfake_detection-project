@@ -68,7 +68,7 @@ function HeroDrop() {
       setProgress({ stage: "validating", pct: 2, note: "Starting" });
       try {
         const out = await runFile(file, DEFAULT_SETTINGS, "upload", {
-          onProgress: (pct) => setProgress({ stage: "forensics", pct, note: "Analyzing" }),
+          onProgress: (stage, pct) => setProgress({ stage, pct, note: "Analyzing" }),
           onSaving: () => {
             setProgress(null);
           },

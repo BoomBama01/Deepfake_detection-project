@@ -46,13 +46,10 @@ import type {
   EvidenceSignal,
   FaceResult,
   MetadataFindings,
-  Verdict,
   VerdictBlock,
-  TimelinePoint,
   EngineInfo,
-  FrameResult,
-  TemporalStats,
 } from "./types";
+import type { ImageAnalysis, VideoAnalysis } from "./types";
 import { ENGINE_INFO } from "./forensics";
 import { renderHeatmap, renderElaImage, renderPreview } from "./artifacts";
 import { analyzeAudio, decodeAudio } from "./audio";
@@ -63,53 +60,8 @@ import { runVideo, type VideoRunInput } from "./video-runner";
 // Public shape the frontend and the Convex layer consume
 // ---------------------------------------------------------------------------
 
-export interface AnalysisResult {
-  kind: "image" | "video";
-  verdict: VerdictBlock;
-  checks: Check[];
-  faces: FaceResult[];
-  signals: EvidenceSignal[];
-  categories: EvidenceCategoryReport[];
-  metadata: MetadataFindings | null;
-  engine: EngineInfo;
-  warnings: string[];
-  processingTimeMs: number;
-  dimensions: { width: number; height: number };
-  hash?: string;
-  evidence?: {
-    fusionScore: number;
-    categories: EvidenceCategoryReport[];
-    signals: EvidenceSignal[];
-    perDetector: Array<{
-      detector: string;
-      version: string;
-      group: string;
-      score: number;
-      confidence: number;
-      reliability: string;
-      ranInMs: number;
-    }>;
-    activeDetectors: number;
-    evidenceStrength: number;
-    elapsedMs: number;
-  };
-  // video-only
-  timeline?: TimelinePoint[];
-  frames?: FrameResult[];
-  suspiciousFrames?: { t: number; score: number }[];
-  temporal?: TemporalStats;
-  audio?: {
-    present: boolean;
-    durationSec: number;
-    sampleRate: number;
-    clippingRatio: number;
-    dcOffset: number;
-    silenceRatio: number;
-    spectralCentroid: number;
-    uniformity: number;
-    note: string;
-  } | null;
-}
+/** Union of the two pipeline return types, for call sites that dispatch on kind. */
+export type AnalysisResult = ImageAnalysis | VideoAnalysis;
 
 // ---------------------------------------------------------------------------
 // Preprocessing
@@ -164,13 +116,19 @@ export async function decodeImage(file: File): Promise<DecodedImage> {
   const bitmap = await createImageBitmap(new Blob([bytes], { type: file.type }));
   if (!bitmap) throw new Error(`Unable to decode “${file.name}”.`);
   try {
-    const { rgba, width, height } = bitmapToRgba(bitmap);
+    // bitmapToRgba accepts ImageData/HTMLCanvasElement/HTMLImageElement but not
+    // ImageBitmap directly, so rasterise the bitmap onto a temporary canvas first.
+    const canvas = document.createElement("canvas");
+    canvas.width = bitmap.width;
+    canvas.height = bitmap.height;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("Canvas 2D context unavailable.");
+    ctx.drawImage(bitmap, 0, 0);
+    const { rgba, width, height } = bitmapToRgba(canvas);
     // For the AI classifier we use a model-normalized view (downscale with a
     // spline filter). The original is preserved for the signal checks, which are
     // resolution-dependent and must not be run on a prematurely downscaled image.
     const modelInput = modelNormalizedImage(rgba, width, height, 1024, "spline36");
-    // We do not throw away the original here; the signal checks below consume the
-    // full RGBA directly. The model view is passed to the classifier only.
     void modelInput; // kept for the classifier path in analyzeImage
     return { rgba, width, height, format, metadata, file };
   } finally {
@@ -270,14 +228,14 @@ async function rgbaToCanvas(rgba: Uint8ClampedArray, w: number, h: number): Prom
 }
 
 // ---------------------------------------------------------------------------
-// Image analysis
+// Image analysis — returns a genuine ImageAnalysis (member of Analysis)
 // ---------------------------------------------------------------------------
 
 export async function analyzeImage(
   file: File,
   settings: AnalysisSettings,
   options?: { onProgress?: (note: string, pct: number) => void },
-): Promise<AnalysisResult> {
+): Promise<ImageAnalysis> {
   const overallT0 = performance.now();
   options?.onProgress?.("validating", 2);
   const problem = validateImage(file);
@@ -338,9 +296,7 @@ export async function analyzeImage(
       },
       neuralClassifier: {
         status: "available",
-        detail: `Classifier backend “${currentBackend().id}” v${currentBackend().version} (${
-          currentBackend().modelBacked ? "trained model" : "measured-feature blend, no trained weights"
-        }).`,
+        detail: `Classifier backend “${currentBackend().id}” v${currentBackend().version} (${currentBackend().modelBacked ? "trained model" : "measured-feature blend, no trained weights"}).`,
       },
       checksRun: checks.map((c) => c.id),
     },
@@ -387,11 +343,9 @@ export async function analyzeImage(
 
   return {
     kind: "image",
-    verdict: decision,
+    ...decision,
     checks,
     faces: faceRun.faces,
-    signals: fusion.signals,
-    categories,
     metadata: decoded.metadata,
     engine: ctx.engine,
     warnings: [
@@ -410,23 +364,20 @@ export async function analyzeImage(
       evidenceStrength: fusion.evidenceStrength,
       elapsedMs: fusion.elapsedMs,
     },
-  };
+  } satisfies ImageAnalysis;
 }
 
 // ---------------------------------------------------------------------------
-// Video analysis — delegates to the dedicated video runner
+// Video analysis — delegates to the dedicated video runner; returns VideoAnalysis
 // ---------------------------------------------------------------------------
 
 export async function analyzeVideo(
   file: File,
   settings: AnalysisSettings,
   options?: { onProgress?: (note: string, pct: number) => void },
-): Promise<AnalysisResult> {
-  // Delegate to the dedicated video runner and return the result as-is.
-  // The video runner returns a VideoAnalysis which is compatible with the
-  // AnalysisResult union member for "video" kinds.
+): Promise<VideoAnalysis> {
   const result = await runVideo(file, settings, options);
-  return result as unknown as AnalysisResult;
+  return result as VideoAnalysis;
 }
 
 export type { VideoRunInput };

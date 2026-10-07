@@ -472,7 +472,7 @@ export async function runVideo(
 
   return {
     kind: "video",
-    verdict: verdictBlock as unknown as Verdict,
+    ...verdictBlock,
     checks: allChecks,
     faces: perFrame.flatMap((pf, i) =>
       pf.faceScores.map((s) => ({
@@ -501,7 +501,7 @@ export async function runVideo(
     frameCount: frames.length,
     dimensions: { width, height },
     evidence,
-  } as unknown as VideoAnalysis;
+  } as VideoAnalysis;
 }
 
 function computeFaceJitter(perFrame: PerFrameResult[]): number {

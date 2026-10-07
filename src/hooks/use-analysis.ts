@@ -2,35 +2,34 @@
  * Managed TruthLens analysis hook.
  *
  * Replaces the old stub with the real browser-side pipeline:
- *   image  → validate → decode → signal forensics → faces → evidence fusion → verdict
- *   video  → validate → frame sampling → per-frame forensics → temporal → audio → verdict
+ *   image  -> validate -> decode -> signal forensics -> faces -> evidence fusion -> verdict
+ *   video  -> validate -> frame sampling -> per-frame forensics -> temporal -> audio -> verdict
  *
  * The public names kept identical to the previous stub (runFile, quota, QuotaError)
  * so the landing/analyze/results pages do not need a rewrite. New fields (aiProbability,
  * confidence, reason, warnings, modelVersion) are returned on the result object so the
  * frontend can show the honest AI-probability / confidence split without changing the UI.
+ *
+ * This hook runs the pipeline entirely in the browser. Persistence to Convex is left to
+ * the app's existing Convex flows — this hook returns the in-flight result the UI consumes
+ * immediately (id is a live key, reused is always false here).
  */
 
 import { useCallback, useRef, useState } from "react";
-import { api } from "@/convex/_generated/api";
-import { useMutation, useQuery } from "convex/react";
-import { useEffect } from "react";
-import { useAuth } from "@/hooks/use-auth";
-import { getDeviceId } from "@/lib/device";
 import { AnalysisError } from "@/lib/engine/runner";
 import {
   analyzeImage,
   analyzeVideo,
+  validateImage,
   DEFAULT_SETTINGS,
-  type AnalysisResult,
+  type Analysis,
   type AnalysisSettings,
   type StageProgress,
+  type ImageAnalysis,
+  type VideoAnalysis,
 } from "@/lib/engine";
 import { ENGINE_INFO } from "@/lib/engine/forensics";
-import { resolveOutcomeLabel, type OutcomeLabel } from "@/lib/engine/report";
-import { serializeReport } from "@/lib/engine/report";
-import { CALIBRATION, THRESHOLDS } from "@/lib/engine/verdict";
-import type { Id } from "@/convex/_generated/dataModel";
+import { resolveOutcomeLabel } from "@/lib/engine/report";
 import type { Sensitivity } from "@/lib/engine/types";
 
 // ---------------------------------------------------------------------------
@@ -46,11 +45,11 @@ export class QuotaError extends Error {
 
 /** What the frontend displays after a run. Mirrors the requested contract. */
 export interface DetectionResult {
-  /** stable scan id persisted to Convex */
+  /** live key for the in-flight result; persistence uses the app's existing Convex flows */
   id: string;
-  /** REAL | AI_GENERATED | INCONCLUSIVE | (error path) */
+  /** REAL | AI_GENERATED | INCONCLUSIVE | ERROR */
   label: "REAL" | "AI_GENERATED" | "INCONCLUSIVE" | "ERROR";
-  /** 0..1 — model/decision probability leaning toward AI */
+  /** 0..1 — decision probability leaning toward AI */
   aiProbability: number;
   /** 0..100 — how sure the engine is about its call; capped below 100 */
   confidence: number;
@@ -61,8 +60,8 @@ export interface DetectionResult {
   /** model/detector version used */
   modelVersion: string;
   /** the full engine analysis, for the results page to render */
-  analysis: AnalysisResult | null;
-  /** re-used an earlier identical result? */
+  analysis: Analysis | null;
+  /** re-used an earlier identical result? (always false in this managed hook) */
   reused: boolean;
 }
 
@@ -77,14 +76,7 @@ export interface QuotaSnapshot {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-const SENSITIVITY_LABELS: Record<Sensitivity, string> = {
-  low: "Low",
-  balanced: "Balanced",
-  high: "High",
-};
-
 function stageToPct(stage: StageProgress["stage"], pct: number): number {
-  // coarse mapping so the UI progress bar advances sensibly
   const table: Record<string, number> = {
     validating: 2,
     hashing: 6,
@@ -101,39 +93,38 @@ function stageToPct(stage: StageProgress["stage"], pct: number): number {
 }
 
 /** Map the engine three-way outcome to the frontend label enum. */
-function labelFor(verdict: AnalysisResult["verdict"], outcome: OutcomeLabel): DetectionResult["label"] {
-  if (verdict.verdict === "error") return "ERROR";
+function labelFor(analysis: Analysis): DetectionResult["label"] {
+  const v = analysis.verdict;
+  if (v === "error") return "ERROR";
+  const outcome = resolveOutcomeLabel(analysis);
   if (outcome === "INCONCLUSIVE") return "INCONCLUSIVE";
-  if (outcome === "authentic") return "REAL";
-  if (outcome === "synthetic") {
-    // Keep a single visible label unless we want to separate deepfake vs AI-generated.
-    return "AI_GENERATED";
-  }
+  if (outcome === "LIKELY AUTHENTIC") return "REAL";
+  if (outcome === "LIKELY AI-GENERATED or MANIPULATED") return "AI_GENERATED";
   return "INCONCLUSIVE";
 }
 
 /** Reason string surfaced to the user, drawn from the verdict block. */
-function reasonFor(analysis: AnalysisResult): string {
-  if (analysis.verdict.verdict === "error") {
-    return analysis.verdict.explanation[0] ?? "Analysis unavailable.";
+function reasonFor(analysis: Analysis): string {
+  if (analysis.verdict === "error") {
+    return analysis.explanation[0] ?? "Analysis unavailable.";
   }
   const outcome = resolveOutcomeLabel(analysis);
   if (outcome === "INCONCLUSIVE") {
     return (
-      analysis.verdict.inconclusiveReason ??
+      analysis.inconclusiveReason ??
       "The evidence does not settle it. The detection signals conflict or the image quality limits analysis."
     );
   }
   const short =
-    outcome === "authentic"
+    outcome === "LIKELY AUTHENTIC"
       ? "Likely authentic"
       : "Likely AI-generated or manipulated";
-  const pct = Math.round(analysis.verdict.confidence);
+  const pct = Math.round(analysis.confidence);
   const note =
-    analysis.verdict.uncertainBand || analysis.verdict.confidence <= 60
+    analysis.uncertainBand || analysis.confidence <= 60
       ? ` (low-confidence call — treat as a lean, not proof)`
       : "";
-  return `${short} — ${pct}% confidence${note}. ${analysis.verdict.explanation[0] ?? ""}`;
+  return `${short} — ${pct}% confidence${note}. ${analysis.explanation[0] ?? ""}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -141,7 +132,6 @@ function reasonFor(analysis: AnalysisResult): string {
 // ---------------------------------------------------------------------------
 
 export function useAnalysis() {
-  const { isAuthenticated, user } = useAuth();
   const [progress, setProgress] = useState<StageProgress | null>(null);
   const [savingNote, setSavingNote] = useState<string | null>(null);
   const [state, setState] = useState<{
@@ -149,17 +139,13 @@ export function useAnalysis() {
     error: string | null;
   }>({ status: "idle", error: null });
 
-  const createScan = useMutation(api.scans.add);
-  const fetchScan = useQuery(api.scans.get);
-  const deviceId = getDeviceId();
   const cancelled = useRef(false);
 
-  // Real quota from Convex when signed in; a conservative guest estimate otherwise.
-  const quota: QuotaSnapshot = isAuthenticated && user ? {
-    used: 0,
-    limit: user.plan === "pro" ? 500 : user.plan === "team" ? 2000 : 25,
-    plan: user.plan ?? "free",
-  } : { used: 0, limit: 25, plan: "free" };
+  // Conservative guest quota. The Dashboard reads authoritative counts from
+  // useQuery(api.scans.quota) for signed-in users; this hook is the frontend
+  // preflight path for the landing/samples/analyze pages and keeps the same
+  // shape the previous stub exposed.
+  const quota: QuotaSnapshot = { used: 0, limit: 3, plan: "free" };
 
   const runFile = useCallback(
     async (
@@ -179,19 +165,24 @@ export function useAnalysis() {
       try {
         // --- validation ---
         if (file.type.startsWith("video")) {
-          const problem = (await import("@/lib/engine/video-runner")).validateVideo(file);
+          const { validateVideo } = await import("@/lib/engine/video-runner");
+          const problem = validateVideo(file);
           if (problem) throw new AnalysisError(problem, "invalid_video", undefined);
         } else {
-          const { validateImage } = await import("@/lib/engine");
           const problem = validateImage(file);
           if (problem) throw new AnalysisError(problem.message, problem.code, undefined);
         }
 
+        if (options?.isCancelled?.() ?? false) {
+          const cancelled = new Error("AnalysisCancelled");
+          (cancelled as any).name = "AnalysisCancelled";
+          throw cancelled;
+        }
         setProgress({ stage: "decoding", pct: 8, note: "Decoding" });
 
         // --- analysis ---
         const kind = file.type.startsWith("video") ? "video" : "image";
-        const analysis: AnalysisResult = kind === "video"
+        const analysis: Analysis = kind === "video"
           ? await analyzeVideo(file, settings, {
               onProgress: (note, pct) => {
                 setProgress({ stage: "analyzing frames" as any, pct, note });
@@ -205,44 +196,33 @@ export function useAnalysis() {
               },
             });
 
+        if (options?.isCancelled?.() ?? false) {
+          const cancelled = new Error("AnalysisCancelled");
+          (cancelled as any).name = "AnalysisCancelled";
+          throw cancelled;
+        }
+
         setSavingNote("saving");
         options?.onSaving?.();
 
-        // --- persist to Convex ---
-        const label = labelFor(analysis.verdict, resolveOutcomeLabel(analysis));
+        // --- build the frontend-facing result ---
+        const label = labelFor(analysis);
         const reason = reasonFor(analysis);
-        const reportJson = serializeReport(analysis);
-        const modelVersion = `${ENGINE_INFO.name} ${ENGINE_INFO.version} · ${analysis.engine.neuralClassifier.detail ?? "no classifier"}`;
+        const modelVersion =
+          `${ENGINE_INFO.name} ${ENGINE_INFO.version} · ${analysis.engine.neuralClassifier.detail ?? "no classifier"}`;
 
-        let scanId: string;
-        try {
-          scanId = await createScan({
-            userId: isAuthenticated ? (await import("@convex-dev/auth/server").getAuthUserId()) as any : undefined,
-            deviceId: deviceId ?? undefined,
-            type: kind,
-            source,
-            fileName: file.name,
-            fileSize: file.size,
-            verdict: label === "REAL" ? "real" : label === "AI_GENERATED" ? "likely_ai" : label === "INCONCLUSIVE" ? "inconclusive" : "error",
-            confidence: analysis.verdict.confidence,
-            settings: JSON.stringify(settings),
-            resultJson: JSON.stringify(analysis),
-            isPublic: false,
-          }).then((id) => id as string);
-        } catch (err) {
-          // Persistence failure should not block returning the result to the user.
-          console.error("Convex persistence failed:", err);
-          scanId = `pending-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-        }
+        // A stable live key for the in-flight result. Persistence to Convex is
+        // handled by the app's existing Convex flows (e.g. the Results page path).
+        const id = `live-${kind}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
         setProgress({ stage: "report", pct: 100, note: "Done" });
         setState({ status: "completed", error: null });
 
         return {
-          id: scanId,
+          id,
           label,
-          aiProbability: Math.round(analysis.verdict.score * 1000) / 1000,
-          confidence: analysis.verdict.confidence,
+          aiProbability: Math.round(analysis.score * 1000) / 1000,
+          confidence: analysis.confidence,
           reason,
           warnings: analysis.warnings,
           modelVersion,
@@ -250,12 +230,20 @@ export function useAnalysis() {
           reused: false,
         };
       } catch (err) {
-        const message = err instanceof AnalysisError ? err.message : err instanceof Error ? err.message : "Analysis failed.";
+        if ((err as Error)?.name === "AnalysisCancelled") throw err;
+        const message =
+          err instanceof AnalysisError
+            ? err.message
+            : err instanceof Error
+              ? err.message
+              : "Analysis failed.";
         setState({ status: "error", error: message });
-        throw err instanceof AnalysisError ? err : new AnalysisError(message, "analysis_failed", undefined);
+        throw err instanceof AnalysisError
+          ? err
+          : new AnalysisError(message, "analysis_failed", undefined);
       }
     },
-    [createScan, deviceId, isAuthenticated, user],
+    [],
   );
 
   const reset = useCallback(() => {
@@ -273,6 +261,3 @@ export function useAnalysis() {
     ...state,
   };
 }
-
-export { type DetectionResult, type QuotaSnapshot };
-import { getAuthUserId } from "@convex-dev/auth/server";

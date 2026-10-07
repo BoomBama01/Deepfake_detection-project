@@ -13,6 +13,7 @@ import {
   ThumbsDown,
   ThumbsUp,
   Trash2,
+  TriangleAlert,
 } from "lucide-react";
 import { api } from "@/convex/_generated/api";
 import type { Id } from "@/convex/_generated/dataModel";
@@ -380,6 +381,69 @@ export default function Results() {
               />
               <StatCard label="Content hash" value={analysis.hash ? `${analysis.hash.slice(0, 16)}…` : "—"} />
             </div>
+
+            {/* Honest AI-probability vs confidence split. */}
+            <div className="rounded-lg border border-border bg-card p-4">
+              <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+                assessment summary
+              </p>
+              <div className="mt-3 flex flex-wrap items-start gap-x-6 gap-y-2">
+                <div>
+                  <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+                    AI probability
+                  </p>
+                  <p className="mt-0.5 font-display text-xl font-semibold tabular-nums">
+                    {(analysis.score * 100).toFixed(0)}%
+                  </p>
+                  <p className="font-mono text-[10px] text-muted-foreground">
+                    0% real · 100% AI-generated
+                  </p>
+                </div>
+                <div>
+                  <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+                    confidence
+                  </p>
+                  <p className="mt-0.5 font-display text-xl font-semibold tabular-nums">
+                    {analysis.confidence.toFixed(0)}%
+                  </p>
+                  <p className="font-mono text-[10px] text-muted-foreground">
+                    not the same as AI probability — capped below 100%
+                  </p>
+                </div>
+                <div>
+                  <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+                    result
+                  </p>
+                  <p className="mt-0.5 font-body text-sm leading-5 text-foreground/90">
+                    {analysis.explanation[0] ?? "—"}
+                  </p>
+                </div>
+              </div>
+              {analysis.warnings.length > 0 ? (
+                <ul className="mt-3 space-y-1">
+                  {analysis.warnings.map((w) => (
+                    <li
+                      key={w}
+                      className="flex items-start gap-2 font-mono text-[11px] leading-5 text-muted-foreground"
+                    >
+                      <TriangleAlert className="mt-0.5 shrink-0 text-[var(--verdict-uncertain)]" />
+                      {w}
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+              <dl className="mt-3 grid gap-x-6 gap-y-1.5 font-mono text-[11px]">
+                <Meta
+                  k="engine"
+                  v={`${analysis.engine.name} v${analysis.engine.version}`}
+                />
+                <Meta
+                  k="classifier"
+                  v={analysis.engine.neuralClassifier.detail}
+                />
+              </dl>
+            </div>
+
             <div>
               <h3 className="mb-3 font-display text-lg font-semibold">Warnings</h3>
               {analysis.warnings.length ? (

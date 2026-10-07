@@ -20,7 +20,6 @@ export {
 // Shared result types.
 export type {
   Analysis,
-  AnalysisSettings,
   Check,
   EvidenceCategoryReport,
   EvidenceSignal,
@@ -34,12 +33,12 @@ export type {
   FrameResult,
   TemporalStats,
   EngineInfo,
-  Sensitivity,
   StageProgress,
 } from "./types";
 
 // Settings + convenience defaults.
 export { DEFAULT_SETTINGS } from "./types";
+export type { AnalysisSettings, Sensitivity } from "./types";
 
 // Verdicts + calibration helpers used by the UI/report layer.
 export {
