@@ -28,6 +28,7 @@ import {
   type ImageAnalysis,
   type VideoAnalysis,
 } from "@/lib/engine";
+import { validateVideo } from "@/lib/engine/video-runner";
 import { ENGINE_INFO } from "@/lib/engine/forensics";
 import { resolveOutcomeLabel } from "@/lib/engine/report";
 import type { Sensitivity } from "@/lib/engine/types";
@@ -165,7 +166,6 @@ export function useAnalysis() {
       try {
         // --- validation ---
         if (file.type.startsWith("video")) {
-          const { validateVideo } = await import("@/lib/engine/video-runner");
           const problem = validateVideo(file);
           if (problem) throw new AnalysisError(problem, "invalid_video", undefined);
         } else {

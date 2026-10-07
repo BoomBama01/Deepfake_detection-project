@@ -1,27 +1,27 @@
-{
-    # Root is the Vite `dist/` directory.
-    root * /usr/share/nginx/html
-}
+# Caddy static SPA config for the TruthLens frontend.
+#
+# Serve `dist/` as the site root (e.g. copy dist into /usr/share/nginx/html or
+# point `root` at the build directory).
+#
+# Rules:
+#   - /assets/* : immutable caching, hard 404 on miss (never the shell page)
+#   - everything else : SPA shell with no-cache headers
+#
+# NOTE: `handle_path` strips the matched prefix, which would make Caddy look up
+# /assets/foo.js as foo.js. `handle` keeps the full path, so we use `handle`.
 
-handle_path /assets/* {
-    # Fingerprinted assets can be cached forever; the hash changes on every deploy.
-    header CachingStrategy public
-    header Cache-Control "max-age=31536000, immutable"
+root * /usr/share/nginx/html
+
+# Fingerprinted assets: cache forever, 404 when missing (no shell fallback).
+handle /assets/* {
+    header Cache-Control "public, max-age=31536000, immutable"
     try_files {path} =404
+    file_server
 }
 
-handle_path /index.html {
-    # The shell page must never be served from cache.
-    header Cache-Control "no-cache, no-store, must-revalidate"
-    try_files /index.html =404
-}
-
-handle_path / {
-    header Cache-Control "no-cache, no-store, must-revalidate"
-    try_files /index.html =404
-}
-
+# Every other path is a client-side route: serve the uncached SPA shell.
 handle {
-    # Any other route the SPA handles client-side.
+    header Cache-Control "no-cache, no-store, must-revalidate"
     try_files /index.html =404
+    file_server
 }

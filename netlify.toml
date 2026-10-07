@@ -1,53 +1,28 @@
+# SPA routing + caching for the TruthLens frontend.
+#
+# Order matters: Netlify evaluates redirect rules top to bottom (existing files
+# are served first), so the /assets/ rule must come before the catch-all.
+# Missing /assets/* files must return 404 — never index.html — otherwise the
+# browser parses HTML as a JS module and Vite throws
+# "Failed to fetch dynamically imported module".
+
+[[redirects]]
+  from = "/assets/*"
+  to = "/index.html"
+  status = 404
+
 [[redirects]]
   from = "/*"
   to = "/index.html"
   status = 200
 
+# Fingerprinted build output: cache forever (the hash changes on every deploy).
 [[headers]]
-  for = "/*.js"
+  for = "/assets/*"
   [headers.values]
     Cache-Control = "public, max-age=31536000, immutable"
 
-[[headers]]
-  for = "/*.css"
-  [headers.values]
-    Cache-Control = "public, max-age=31536000, immutable"
-
-[[headers]]
-  for = "/*.png"
-  [headers.values]
-    Cache-Control = "public, max-age=31536000, immutable"
-
-[[headers]]
-  for = "/*.jpg"
-  [headers.values]
-    Cache-Control = "public, max-age=31536000, immutable"
-
-[[headers]]
-  for = "/*.jpeg"
-  [headers.values]
-    Cache-Control = "public, max-age=31536000, immutable"
-
-[[headers]]
-  for = "/*.gif"
-  [headers.values]
-    Cache-Control = "public, max-age=31536000, immutable"
-
-[[headers]]
-  for = "/*.svg"
-  [headers.values]
-    Cache-Control = "public, max-age=31536000, immutable"
-
-[[headers]]
-  for = "/*.webmanifest"
-  [headers.values]
-    Cache-Control = "public, max-age=31536000, immutable"
-
-[[headers]]
-  for = "/*.wasm"
-  [headers.values]
-    Cache-Control = "public, max-age=31536000, immutable"
-
+# The shell page must never be served from cache.
 [[headers]]
   for = "/index.html"
   [headers.values]

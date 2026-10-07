@@ -4,7 +4,7 @@ import { RequireAuth } from "@/components/RequireAuth";
 import { VlyToolbar } from "../vly-toolbar-readonly.tsx";
 import { ConvexAuthProvider } from "@convex-dev/auth/react";
 import { ConvexReactClient } from "convex/react";
-import React, { StrictMode, useEffect, lazy, Suspense } from "react";
+import React, { StrictMode, useEffect, Suspense } from "react";
 import { createRoot } from "react-dom/client";
 import { BrowserRouter, Route, Routes, useLocation } from "react-router";
 import "./index.css";
@@ -16,11 +16,11 @@ import "./index.css";
 //  - listen for Vite's preloadError event and hard-reload the page,
 //  - wrap every lazy() import in a retry loader (2 attempts) and then, once, reload
 //    the page while a sessionStorage flag prevents a reload loop.
-async function retryLazyImportDeferred(
-  importFn: () => Promise<{ default: React.ComponentType<{}> }>,
+async function retryLazyImportDeferred<P>(
+  importFn: () => Promise<{ default: React.ComponentType<P> }>,
   key: string,
   reloadOnFailure: boolean,
-): Promise<React.ComponentType<{}>> {
+): Promise<React.ComponentType<P>> {
   const sessionKey = `truthlens.lazy.${key}.attempted`;
   const alreadyReloaded = () => {
     try { return sessionStorage.getItem(sessionKey) === "reloaded"; } catch { return false; }
@@ -62,17 +62,23 @@ async function retryLazyImportDeferred(
     window.location.reload();
   }
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return ((React as any).Fragment) as any;
+  // Last resort: render nothing rather than crash if even the reload loop was
+  // blocked (e.g. sessionStorage disabled in a sandboxed iframe).
+  return React.Fragment as unknown as React.ComponentType<P>;
 }
 
-function lazyWithRetry(
+function lazyWithRetry<P extends object>(
   key: string,
-  importFn: () => Promise<{ default: React.ComponentType<{}> }>,
-): React.LazyExoticComponent<React.ComponentType<Record<string, never>>> {
+  importFn: () => Promise<{ default: React.ComponentType<P> }>,
+): React.LazyExoticComponent<React.ComponentType<P>> {
   // Cast through unknown to satisfy React's strict Lazy loader return type while
   // keeping our internal retry loader typed around the default export.
-  return React.lazy(() => retryLazyImportDeferred(importFn, key, true) as unknown as Promise<{ default: React.ComponentType<Record<string, never>> }>);
+  return React.lazy(
+    () =>
+      retryLazyImportDeferred(importFn, key, true) as unknown as Promise<{
+        default: React.ComponentType<P>;
+      }>,
+  );
 }
 
 const Landing = lazyWithRetry("Landing", () => import("./pages/Landing.tsx"));
@@ -209,7 +215,7 @@ createRoot(document.getElementById("root")!).render(
               <Route path="/" element={<Landing />} />
               <Route
                 path="/auth"
-                element={<AuthPage />}
+                element={<AuthPage redirectAfterAuth="/dashboard" />}
               />
               <Route path="/analyze" element={<Analyze />} />
               <Route path="/results/:id" element={<Results />} />

@@ -25,13 +25,20 @@ always fetches the latest manifest of hashed chunk URLs:
 
 We apply this to the following host-specific rules:
 
-- Vercel: `vercel.json` rewrites all routes to `/index.html`, and declares explicit
-  `headers` entries for `"/index.html"` and `"/"` with no-cache.
-- Netlify: `netlify.toml` sets the same no-cache header on `/index.html` and `"/"`.
-- Render: `static.json` does the same via its `headers` array.
-- nginx: an explicit `location = /index.html` and `location = /` block set no-cache,
-  while the catch-all SPA route also uses `try_files /index.html =404`.
-- Caddy: equivalent `handle_path` matchers set no-cache on the shell page.
+- Vercel: `vercel.json` rewrites only non-`/assets` paths to `/index.html` (a
+  negative lookahead), so a missing chunk returns Vercel's 404 instead of a 200
+  HTML page, and declares explicit `headers` with no-cache on page routes and
+  immutable caching on `/assets/*`.
+- Netlify: `netlify.toml` puts a `/assets/*` → 404 rule *before* the SPA catch-all
+  (Netlify evaluates rules top to bottom), and sets the same no-cache header on
+  `/index.html` and `"/"`.
+- nginx: `nginx.conf` has an explicit `location ~* ^/assets/` block with
+  `try_files $uri =404` that runs before the SPA fallback, `location = /index.html`
+  and `location = /` blocks set no-cache, while the catch-all SPA route also uses
+  `try_files /index.html =404`.
+- Caddy: `caddyfile` uses `handle /assets/*` (NOT `handle_path`, which would strip
+  the prefix) with `try_files {path} =404`, and a `handle` block serves the
+  no-cache shell for everything else.
 
 ### 2. Assets are cached forever
 
@@ -43,6 +50,11 @@ changes on every deploy:
 This applies to JS, CSS, images, the web manifest, and WASM files in every
 host config above. A 404 on an unknown asset is correct: the browser should retry
 the new deploy rather than receive a cached shell page.
+
+Every config in this repo implements this. `server.js` is a dependency-free
+reference implementation of the same rules (run `node server.js` after a build);
+its handler is exported so it can be exercised in a test without binding a
+long-lived port.
 
 ### 3. Missing assets must not fall back to index.html
 
@@ -70,7 +82,6 @@ They are not cumulative — pick one.
 
 - **Vercel**: keep `vercel.json` and remove the others.
 - **Netlify**: keep `netlify.toml` and remove the others.
-- **Render (static)**: keep `static.json` and remove the others.
 - **nginx**: keep `nginx.conf` and remove the others.
 - **Caddy**: keep `caddyfile` and remove the others.
 
