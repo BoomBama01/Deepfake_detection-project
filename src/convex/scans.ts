@@ -4,18 +4,6 @@ import { getAuthUserId } from "@convex-dev/auth/server";
 import { auth } from "./auth";
 import { verdictValidator } from "./schema";
 
-/** Guest fallback device id from headers, for device-scoped quota when not signed in. */
-async function getDeviceIdFallback(ctx: any): Promise<string | null> {
-  try {
-    const header =
-      ctx.req.headers.get("x-truthlens-device-id") ?? ctx.req.headers.get("x-device-id");
-    if (header) return header;
-  } catch {
-    /* no req / no headers */
-  }
-  return null;
-}
-
 // ---------------------------------------------------------------------------
 // Resilient scan profile returned to the client.
 //
@@ -241,7 +229,9 @@ export const getUploadUrl = mutation({
   args: { contentType: v.string(), name: v.string() },
   handler: async (ctx, args) => {
     try {
-      return { url: await ctx.storage.generateUploadUrl() } as const;
+      return {
+        url: await ctx.storage.generateUploadUrl(),
+      } as const;
     } catch (err) {
       console.error("[getUploadUrl] failed", err);
       throw new Error("Could not get an upload URL.");
@@ -312,9 +302,8 @@ export const finishScan = mutation({
   },
 });
 
-/** ---------------------------------------------------------------------------
-
-/** Create a scan row. Always writes status + createdAt + expiresAt. */
+/** Create a scan row. Always writes status + createdAt + expiresAt.
+ *  Accepts either a signed-in userId or a guest deviceId (device-scoped). */
 export const add = mutation({
   args: {
     userId: v.optional(v.id("users")),
@@ -353,10 +342,11 @@ export const add = mutation({
   },
   handler: async (ctx, args) => {
     try {
-      const guestDeviceId = args.deviceId ?? (await getDeviceIdFallback(ctx)) as any;
       const userId = (await getAuthUserId(ctx)) as any;
-      if (!userId && !guestDeviceId) throw new Error("Sign in first.");
-      if (args.userId && userId && args.userId !== userId) throw new Error("Not your scan.");
+      const deviceId = args.deviceId ?? (await getDeviceIdFallback(ctx)) as any;
+      if (!userId && !deviceId) throw new Error("Sign in first.");
+      if (args.userId && userId && args.userId !== userId)
+        throw new Error("Not your scan.");
 
       const now = Math.floor(Date.now() / 1000);
       const expiresAt = now + 60 * 60 * 24 * 30;
@@ -377,7 +367,7 @@ export const add = mutation({
 
       const doc = {
         userId: userId ?? null,
-        deviceId: guestDeviceId,
+        deviceId,
         type: args.type,
         source: args.source,
         fileName: args.fileName,
@@ -532,6 +522,18 @@ export const apiQuotaFor = query({
   },
 });
 
+/** Guest fallback device id from headers, for device-scoped quota when not signed in. */
+async function getDeviceIdFallback(ctx: any): Promise<string | null> {
+  try {
+    const header =
+      ctx.req.headers.get("x-truthlens-device-id") ?? ctx.req.headers.get("x-device-id");
+    if (header) return header;
+  } catch {
+    /* no req / no headers */
+  }
+  return null;
+}
+
 export const scans = {
   add,
   getById,
@@ -548,4 +550,6 @@ export const scans = {
   apiListFor,
   apiGetFor,
   apiQuotaFor,
+  getUploadUrl,
+  finishScan,
 };

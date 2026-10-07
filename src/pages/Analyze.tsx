@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type DragEvent } from "react";
-import { useAction } from "convex/react";
+import { useAction, useMutation } from "convex/react";
 import { useNavigate } from "react-router";
 import { toast } from "sonner";
 import {
@@ -36,6 +36,10 @@ import {
   type StageProgress,
 } from "@/lib/engine/types";
 import { formatBytes } from "@/lib/format";
+import { renderPreview, dataUrlToBlob } from "@/lib/engine/artifacts";
+import { getDeviceId } from "@/lib/device";
+import type { Id } from "@/convex/_generated/dataModel";
+import type { DetectionResult } from "@/hooks/use-analysis";
 
 const SETTINGS_KEY = "truthlens-settings";
 
@@ -99,8 +103,7 @@ function Stepper({
           return (
             <li
               key={s}
-              className={`flex items-center gap-2 font-mono text-xs ${
-                active ? "text-primary" : done ? "text-foreground/80" : "text-muted-foreground/60"
+              className={`flex items-center gap-2 font-mono text-xs ${                active ? "text-primary" : done ? "text-foreground/80" : "text-muted-foreground/60"
               }`}
             >
               {done ? (
@@ -129,10 +132,29 @@ interface BatchItem {
   reused?: boolean;
 }
 
+/** Decode a File into an HTMLImageElement for the artifact renderers. */
+async function fileToImage(file: File): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      resolve(img);
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error("Could not decode image."));
+    };
+    img.src = url;
+  });
+}
+
 export default function Analyze() {
   const { runFile, quota } = useAnalysis();
   const fetchRemote = useAction(api.proxy.fetchRemoteMedia);
   const navigate = useNavigate();
+  const getUploadUrl = useMutation(api.scans.getUploadUrl);
+  const createScan = useMutation(api.scans.add);
 
   const [settings, setSettings] = useState<AnalysisSettings>(loadSettings);
   const [consent, setConsent] = useState(false);
@@ -178,6 +200,46 @@ export default function Analyze() {
     return true;
   }, [consent, navigate, quota]);
 
+  const persistAnalysis = useCallback(
+    async (
+      file: File,
+      source: "upload" | "url" | "sample",
+      out: DetectionResult,
+    ): Promise<Id<"scans">> => {
+      setSavingNote("saving");
+      const img = await fileToImage(file);
+      const preview = renderPreview(img, img.naturalWidth, img.naturalHeight);
+      const uploadUrlResult = await getUploadUrl({
+        contentType: preview.dataUrl.split(",")[0].split(";")[0].replace("data:", ""),
+        name: file.name + ".preview.jpg",
+      });
+      const uploadRes = await fetch(uploadUrlResult.url, {
+        method: "POST",
+        body: dataUrlToBlob(preview.dataUrl),
+      });
+      const { storageId } = (await uploadRes.json()) as { storageId: Id<"_storage"> };
+      if (!storageId) throw new Error("Storage upload did not return an id.");        const analysis = out.analysis;
+        const verdict = analysis?.verdict;
+        const confidence = analysis?.confidence;
+        const createRes = await createScan({
+          type: file.type.startsWith("video") ? ("video" as const) : ("image" as const),
+          source,
+          fileName: file.name,
+          status: "done",
+          verdict: verdict ?? undefined,
+          confidence: confidence ?? undefined,
+        settings: JSON.stringify(settings),
+        resultJson: JSON.stringify(analysis ?? {}),
+        deviceId: getDeviceId(),
+        previewId: storageId,
+        isPublic: false,
+      });
+      setSavingNote(null);
+      return createRes;
+    },
+    [settings, getUploadUrl, createScan],
+  );
+
   const runSingle = useCallback(
     async (file: File, source: "upload" | "url" | "sample" = "upload") => {
       if (!preflight()) return;
@@ -188,8 +250,13 @@ export default function Analyze() {
         const out = await runFile(file, settings, source, {
           isCancelled: () => cancelled.current,
         });
-        if (out.reused) toast.info("Identical file + settings: reusing the earlier result.");
-        navigate(`/results/${out.id}`);
+        if (out.reused) {
+          toast.info("Identical file + settings: reusing the earlier result.");
+          navigate(`/results/${out.id}`);
+          return;
+        }
+        const scanId = await persistAnalysis(file, source, out);
+        navigate(`/results/${scanId}`);
       } catch (err) {
         setProgress(null);
         setSavingNote(null);
@@ -198,10 +265,27 @@ export default function Analyze() {
         else if (err instanceof AnalysisError)
           toast.error(err.details ? `${err.message} — ${err.details}` : err.message);
         else if ((err as Error)?.name === "AnalysisCancelled") toast.info("Scan cancelled.");
-        else toast.error(err instanceof Error ? err.message : "Analysis failed.");
+        else {
+          const msg = err instanceof Error ? err.message : "Analysis failed.";
+          toast.error(msg);
+          try {
+            await createScan({
+              type: file.type.startsWith("video") ? ("video" as const) : ("image" as const),
+              source,
+              fileName: file.name,
+              status: "error",
+              errorMessage: msg,
+              settings: JSON.stringify(settings),
+              deviceId: getDeviceId(),
+              isPublic: false,
+            });
+          } catch {
+            /* give up on the error-row write */
+          }
+        }
       }
     },
-    [navigate, preflight, runFile, settings],
+    [navigate, preflight, runFile, settings, persistAnalysis, createScan],
   );
 
   const onDrop = (e: DragEvent) => {
@@ -212,46 +296,65 @@ export default function Analyze() {
     if (file) void runSingle(file);
   };
 
-  const onBatchDrop = async (files: FileList | File[]) => {
-    if (!preflight()) return;
-    const list = Array.from(files).slice(0, LIMITS.batchMax);
-    if (!list.length) return;
-    if (files.length > LIMITS.batchMax) {
-      toast.warning(`Batch limited to ${LIMITS.batchMax} files — extra files were skipped.`);
-    }
-    setBatch(list.map((f) => ({ file: f, status: "queued", pct: 0 })));
-    for (let i = 0; i < list.length; i++) {
-      if (cancelled.current) break;
-      setBatch((b) =>
-        b.map((it, j) => (j === i ? { ...it, status: "running", stage: "starting" } : it)),
-      );
-      try {
-        const out = await runFile(list[i], settings, "upload", {
-
-        });
-        setBatch((b) =>
-          b.map((it, j) =>
-            j === i
-              ? { ...it, status: "done", pct: 100, resultId: out.id, reused: out.reused }
-              : it,
-          ),
-        );
-      } catch (err) {
-        setBatch((b) =>
-          b.map((it, j) =>
-            j === i
-              ? {
-                  ...it,
-                  status: "error",
-                  error: err instanceof Error ? err.message : "Failed",
-                }
-              : it,
-          ),
-        );
+  const onBatchDrop = useCallback(
+    async (files: FileList | File[]) => {
+      if (!preflight()) return;
+      const list = Array.from(files).slice(0, LIMITS.batchMax);
+      if (!list.length) return;
+      if (files.length > LIMITS.batchMax) {
+        toast.warning(`Batch limited to ${LIMITS.batchMax} files — extra files were skipped.`);
       }
-    }
-    toast.success("Batch finished.");
-  };
+      setBatch(list.map((f) => ({ file: f, status: "queued", pct: 0 })));
+      for (let i = 0; i < list.length; i++) {
+        if (cancelled.current) break;
+        setBatch((b) =>
+          b.map((it, j) => (j === i ? { ...it, status: "running", stage: "starting" } : it)),
+        );
+        try {
+          const out = await runFile(list[i], settings, "upload", {
+            isCancelled: () => cancelled.current,
+          });
+          if (out.reused) {
+            setBatch((b) =>
+              b.map((it, j) =>
+                j === i
+                  ? { ...it, status: "done", pct: 100, resultId: out.id, reused: true }
+                  : it,
+              ),
+            );
+            continue;
+          }
+          setBatch((b) =>
+            b.map((it, j) =>
+              j === i ? { ...it, status: "running", stage: "saving" } : it,
+            ),
+          );
+          const scanId = await persistAnalysis(list[i], "upload", out);
+          setBatch((b) =>
+            b.map((it, j) =>
+              j === i
+                ? { ...it, status: "done", pct: 100, resultId: scanId, reused: false }
+                : it,
+            ),
+          );
+        } catch (err) {
+          setBatch((b) =>
+            b.map((it, j) =>
+              j === i
+                ? {
+                    ...it,
+                    status: "error",
+                    error: err instanceof Error ? err.message : "Failed",
+                  }
+                : it,
+            ),
+          );
+        }
+      }
+      toast.success("Batch finished.");
+    },
+    [preflight, runFile, settings, persistAnalysis, LIMITS.batchMax],
+  );
 
   const submitUrl = async () => {
     setUrlError(null);
@@ -291,8 +394,7 @@ export default function Analyze() {
       }}
       onDragLeave={() => setDragging(false)}
       onDrop={onDrop}
-      className={`mt-4 flex cursor-pointer flex-col items-center justify-center rounded-lg border-2 border-dashed px-6 py-12 text-center transition-colors ${
-        dragging ? "border-primary bg-primary/5" : "border-border hover:border-primary/60 hover:bg-primary/5"
+      className={`mt-4 flex cursor-pointer flex-col items-center justify-center rounded-lg border-2 border-dashed px-6 py-12 text-center transition-colors ${        dragging ? "border-primary bg-primary/5" : "border-border hover:border-primary/60 hover:bg-primary/5"
       }`}
     >
       <span className="flex size-12 items-center justify-center rounded-full bg-primary/10 text-primary">
@@ -594,8 +696,7 @@ export default function Analyze() {
                   setDragging(false);
                   if (e.dataTransfer.files?.length) void onBatchDrop(e.dataTransfer.files);
                 }}
-                className={`mt-4 rounded-lg border-2 border-dashed px-6 py-8 text-center ${
-                  dragging ? "border-primary bg-primary/5" : "border-border"
+                className={`mt-4 rounded-lg border-2 border-dashed px-6 py-8 text-center ${                  dragging ? "border-primary bg-primary/5" : "border-border"
                 }`}
               >
                 <Upload className="mx-auto size-5 text-primary" />
