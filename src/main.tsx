@@ -8,78 +8,14 @@ import React, { StrictMode, useEffect, Suspense } from "react";
 import { createRoot } from "react-dom/client";
 import { BrowserRouter, Route, Routes, useLocation } from "react-router";
 import "./index.css";
+import { lazyWithRetry } from "@/lib/lazy-retry";
 
-// React.lazy chunk loader with redeploy resilience.
-// After a deploy the browser may be handed a stale index.html route handler that
-// returns 200 for a now-missing /assets/* chunk, so dynamic imports can fail with a
-// "Failed to fetch dynamically imported module" Vite error. We:
-//  - listen for Vite's preloadError event and hard-reload the page,
-//  - wrap every lazy() import in a retry loader (2 attempts) and then, once, reload
-//    the page while a sessionStorage flag prevents a reload loop.
-async function retryLazyImportDeferred<P>(
-  importFn: () => Promise<{ default: React.ComponentType<P> }>,
-  key: string,
-  reloadOnFailure: boolean,
-): Promise<React.ComponentType<P>> {
-  const sessionKey = `truthlens.lazy.${key}.attempted`;
-  const alreadyReloaded = () => {
-    try { return sessionStorage.getItem(sessionKey) === "reloaded"; } catch { return false; }
-  };
-  const markAttempted = () => {
-    try { sessionStorage.setItem(sessionKey, "attempted"); } catch { /* ignore */ }
-  };
-  const markReloaded = () => {
-    try { sessionStorage.setItem(sessionKey, "reloaded"); } catch { /* ignore */ }
-  };
-  const clearState = () => {
-    try { sessionStorage.removeItem(sessionKey); } catch { /* ignore */ }
-  };
-
-  markAttempted();
-  let lastError: unknown = null;
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    try {
-      const mod = await importFn();
-      if (typeof mod.default !== "function")
-        throw new Error(`Lazy module ${key} has no default export`);
-      clearState();
-      return mod.default;
-    } catch (err) {
-      lastError = err;
-      if (attempt < 2) {
-        await new Promise((r) => setTimeout(r, 700));
-      }
-    }
-  }
-
-  console.warn(
-    `[truthlens] Lazy chunk failed after 2 attempts for ${key}.`,
-    lastError instanceof Error ? lastError.message : lastError,
-  );
-
-  if (reloadOnFailure && !alreadyReloaded()) {
-    markReloaded();
-    window.location.reload();
-  }
-
-  // Last resort: render nothing rather than crash if even the reload loop was
-  // blocked (e.g. sessionStorage disabled in a sandboxed iframe).
-  return React.Fragment as unknown as React.ComponentType<P>;
-}
-
-function lazyWithRetry<P extends object>(
-  key: string,
-  importFn: () => Promise<{ default: React.ComponentType<P> }>,
-): React.LazyExoticComponent<React.ComponentType<P>> {
-  // Cast through unknown to satisfy React's strict Lazy loader return type while
-  // keeping our internal retry loader typed around the default export.
-  return React.lazy(
-    () =>
-      retryLazyImportDeferred(importFn, key, true) as unknown as Promise<{
-        default: React.ComponentType<P>;
-      }>,
-  );
-}
+// Route chunks are loaded through lazyWithRetry() (src/lib/lazy-retry.ts):
+// it retries a failed dynamic import twice, then reloads the page once with a
+// sessionStorage guard against reload loops — recovering from stale-shell
+// redeploys where /assets/* hashes no longer exist ("Failed to fetch dynamically
+// imported module"). A global vite:preloadError listener below covers Vite's own
+// preload failures.
 
 const Landing = lazyWithRetry("Landing", () => import("./pages/Landing.tsx"));
 const AuthPage = lazyWithRetry("Auth", () => import("./pages/Auth.tsx"));
