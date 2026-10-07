@@ -65,7 +65,12 @@ const schema = defineSchema(
       userId: v.optional(v.id("users")),
       deviceId: v.optional(v.string()), // guest ownership for the 3/day quota
       type: mediaTypeValidator,
-      status: v.union(v.literal("done"), v.literal("failed")),
+      status: v.union(
+        v.literal("pending"),
+        v.literal("processing"),
+        v.literal("done"),
+        v.literal("error"),
+      ),
       source: v.union(v.literal("upload"), v.literal("url"), v.literal("sample")),
       fileName: v.string(),
       fileHash: v.optional(v.string()), // SHA-256 of the original bytes
@@ -77,8 +82,18 @@ const schema = defineSchema(
       confidence: v.optional(v.number()), // 0..100
       settings: v.string(), // JSON of the settings used for this run
       resultJson: v.optional(v.string()), // full engine output
+      errorMessage: v.optional(v.string()), // why a run is in "error" status
       isPublic: v.optional(v.boolean()),
       pinned: v.optional(v.boolean()), // keep media artifacts past expiry
+      frameUrls: v.optional(
+        v.array(
+          v.object({
+            t: v.number(),
+            imageStorageId: v.optional(v.id("_storage")),
+            heatStorageId: v.optional(v.id("_storage")),
+          }),
+        ),
+      ), // video frame artifacts
       createdAt: v.number(),
       expiresAt: v.number(), // media artifacts are deleted at this point
     })

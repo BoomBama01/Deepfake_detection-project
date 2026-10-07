@@ -14,6 +14,7 @@ import {
   ThumbsUp,
   Trash2,
   TriangleAlert,
+  AlertCircle,
 } from "lucide-react";
 import { api } from "@/convex/_generated/api";
 import type { Id } from "@/convex/_generated/dataModel";
@@ -143,32 +144,82 @@ export default function Results() {
     );
   }
 
-  if (!analysis) {
+  if (scan.status === "processing") {
     return (
       <div className="flex min-h-screen flex-col">
         <Navbar variant="app" />
-        <main className="mx-auto flex w-full max-w-lg flex-1 items-center justify-center px-6">
-          <p className="font-body text-sm text-muted-foreground">Stored result is unreadable.</p>
+        <main className="mx-auto flex w-full max-w-lg flex-1 flex-col items-center justify-center px-6 py-20 text-center">
+          <Loader2 className="size-8 animate-spin text-primary mb-4" />
+          <h1 className="font-display text-2xl font-semibold">Still analysing</h1>
+          <p className="mt-3 font-body text-sm leading-6 text-muted-foreground">
+            {scan.note ?? "This scan is still being processed."}
+          </p>
+          <Button asChild className="mt-6" variant="outline">
+            <a href={`/results/${id}`}>Refresh</a>
+          </Button>
         </main>
         <Footer />
       </div>
     );
   }
 
-  const settings = safeParse(scan.settings);
+  if (scan.status === "error" || scan.status === "pending") {
+    return (
+      <div className="flex min-h-screen flex-col">
+        <Navbar variant="app" />
+        <main className="mx-auto flex w-full max-w-lg flex-1 flex-col items-center justify-center px-6 py-20 text-center">
+          <AlertCircle className="size-8 text-[var(--verdict-fake)] mb-4" />
+          <h1 className="font-display text-2xl font-semibold">
+            {scan.status === "error" ? "Analysis unavailable" : "Not yet analysed"}
+          </h1>
+          <p className="mt-3 font-body text-sm leading-6 text-muted-foreground">
+            {scan.note ??
+              (scan.status === "error"
+                ? "This scan did not complete. Try re-analysing the file."
+                : "This scan has not been processed yet.")}
+          </p>
+          <Button asChild className="mt-6" variant="outline">
+            <a href={`/analyze?returnTo=/results/${id}`}>Re-analyse</a>
+          </Button>
+        </main>
+        <Footer />
+      </div>
+    );
+  }
+
+  if (!analysis) {
+    return (
+      <div className="flex min-h-screen flex-col">
+        <Navbar variant="app" />
+        <main className="mx-auto flex w-full max-w-lg flex-1 items-center justify-center px-6">
+          <AlertCircle className="size-8 text-[var(--verdict-uncertain)] mb-4" />
+          <p className="font-body text-sm text-muted-foreground">
+            Stored result is unreadable.
+          </p>
+          <Button asChild className="mt-4" variant="outline">
+            <a href="/analyze">Run a new examination</a>
+          </Button>
+        </main>
+        <Footer />
+      </div>
+    );
+  }
+
+  const settings = safeParse(scan.settings ?? "");
   const sensitivity = (settings?.sensitivity ?? "balanced") as keyof typeof THRESHOLDS;
   const th = THRESHOLDS[sensitivity] ?? THRESHOLDS.balanced;
   const isVideo = analysis.kind === "video";
   const video = isVideo ? (analysis as VideoAnalysis) : null;
   const shareUrl = `${window.location.origin}/results/${id}`;
+  const fileName = scan.fileName ?? "media";
 
   /** Downloads the forensic report — the same document the page renders. */
   const downloadJson = () => {
     const payload = {
       scanId: id,
-      fileName: scan.fileName,
+      fileName,
       source: scan.source,
-      settings: scan.settings,
+      settings: scan.settings ?? "",
       createdAt: new Date(scan.createdAt).toISOString(),
       expiresAt: new Date(scan.expiresAt).toISOString(),
       report: buildReport(analysis),
@@ -243,7 +294,7 @@ export default function Results() {
           <ForensicReportView
             analysis={analysis}
             caseId={id.slice(0, 10)}
-            fileName={scan.fileName}
+            fileName={fileName}
             title={title}
           />
         </section>
@@ -270,7 +321,7 @@ export default function Results() {
             className="gap-1.5"
             onClick={() => {
               try {
-                sessionStorage.setItem("truthlens-settings", scan.settings);
+                sessionStorage.setItem("truthlens-settings", scan.settings ?? "");
               } catch {
                 /* ignore */
               }
@@ -859,8 +910,8 @@ function FrameGallery({
   );
 }
 
-function labelOf(v: string): string {
-  return v.replace(/_/g, " ");
+function labelOf(v: string | null): string {
+  return (v ?? "").replace(/_/g, " ");
 }
 
 function safeParse(json: string): Record<string, unknown> | null {
