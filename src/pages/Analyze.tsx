@@ -186,11 +186,6 @@ export default function Analyze() {
       setProgress({ stage: "validating", pct: 2, note: "Validating file" });
       try {
         const out = await runFile(file, settings, source, {
-          onProgress: setProgress,
-          onSaving: (_p, note) => {
-            setProgress(null);
-            setSavingNote(note);
-          },
           isCancelled: () => cancelled.current,
         });
         if (out.reused) toast.info("Identical file + settings: reusing the earlier result.");
@@ -201,7 +196,7 @@ export default function Analyze() {
         setStartedAt(null);
         if (err instanceof QuotaError) toast.error(err.message);
         else if (err instanceof AnalysisError)
-          toast.error(err.detail ? `${err.message} — ${err.detail}` : err.message);
+          toast.error(err.details ? `${err.message} — ${err.details}` : err.message);
         else if ((err as Error)?.name === "AnalysisCancelled") toast.info("Scan cancelled.");
         else toast.error(err instanceof Error ? err.message : "Analysis failed.");
       }
@@ -232,16 +227,7 @@ export default function Analyze() {
       );
       try {
         const out = await runFile(list[i], settings, "upload", {
-          onProgress: (s) =>
-            setBatch((b) =>
-              b.map((it, j) =>
-                j === i ? { ...it, pct: Math.round(s.pct), stage: s.stage } : it,
-              ),
-            ),
-          onSaving: (p, note) =>
-            setBatch((b) =>
-              b.map((it, j) => (j === i ? { ...it, pct: p, stage: note } : it)),
-            ),
+
         });
         setBatch((b) =>
           b.map((it, j) =>

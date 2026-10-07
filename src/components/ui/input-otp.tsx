@@ -68,7 +68,7 @@ const InputOTPSlot = React.forwardRef<
       onChange={(e) => {
         const val = e.target.value;
         setValue(val);
-        props.onChange?.(e);
+        props.onChange?.(val);
       }}
       value={value}
     />

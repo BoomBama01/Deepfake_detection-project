@@ -69,7 +69,7 @@ export default function Results() {
   const deviceId = getDeviceId();
   const scan = useQuery(
     api.scans.get,
-    valid ? { id: id as Id<"scans">, deviceId } : "skip",
+    valid ? { id: id as Id<"scans"> } : "skip",
   ) as Scan | undefined | null;
   const setVisibility = useMutation(api.scans.setVisibility);
   const setPinned = useMutation(api.scans.setPinned);
@@ -420,7 +420,7 @@ export default function Results() {
                 )}
               </>
             ) : isVideo ? (
-              <FrameGallery scan={scan} analysis={video!} />
+              <FrameGallery scan={scan as any} analysis={video!} compact />
             ) : scan.mediaExpired ? (
               <MissingArtifact what="Media artifacts expired 24 hours after analysis (privacy policy). The measurements above remain." />
             ) : (
@@ -474,7 +474,7 @@ export default function Results() {
               />
               <div className="grid gap-4 sm:grid-cols-2">
                 <TemporalCard video={video} />
-                <FrameGallery scan={scan} analysis={video} compact />
+                <FrameGallery scan={scan as any} analysis={video} compact />
               </div>
             </TabsContent>
           )}
@@ -737,7 +737,7 @@ function FrameGallery({
   if (!frames.length) {
     return <MissingArtifact what="No suspicious frames were captured for this video." />;
   }
-  const urlFor = (t: number) => scan.frameUrls.find((f) => Math.abs(f.t - t) < 1e-6);
+  const urlFor = (t: number) => (scan as any).frameUrls?.find((f: any) => Math.abs(f.t - t) < 1e-6);
   return (
     <div>
       {!compact && (

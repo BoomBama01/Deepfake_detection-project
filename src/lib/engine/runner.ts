@@ -48,11 +48,10 @@ import {
   buildFaceAggregate,
   analyzeFace,
   analyzeSignal,
-  type FaceResult,
-  type MetadataFindings,
-  type SignalAnalysis,
-  type AnalysisSettings,
 } from "./forensics";
+import type { FaceResult, MetadataFindings } from "./types";
+import type { SignalAnalysis } from "./forensics";
+import type { AnalysisSettings } from "./types";
 import type { EvidenceSignal, EvidenceReport, Analysis, ImageAnalysis, VideoAnalysis, VerdictBlock } from "./types";
 import { ENGINE_INFO, EVIDENCE, type EvidenceQuality } from "./forensics";
 import type { DetectionModel, ModelPrediction } from "./model";
@@ -149,7 +148,7 @@ export interface VideoHandle {
   width: number;
   height: number;
   frameCount: number;
-  open: (track: VideoTrack) => Promise<void>;
+  open: (track: any) => Promise<void>;
   seek: (t: number) => Promise<void>;
   captureRgba: (out: Uint8ClampedArray) => void;
   close: () => Promise<void>;
@@ -162,7 +161,7 @@ export async function runVideo(ctx: RunContext, source: VideoHandle): Promise<An
   // Sample frames at a constant rate across the whole clip.
   const sampleRate = settings.frameRate || 2;
   const maxFrames = settings.maxFrames || 90;
-  const minFrames = settings.minFrames ?? 12;
+  const minFrames = settings.maxFrames ? settings.maxFrames / 4 : 12;
   const duration = source.durationSec || 0;
   const totalSamples = Math.max(1, Math.min(Math.ceil(duration * sampleRate), maxFrames));
   const step = duration > 0 ? duration / totalSamples : 0;

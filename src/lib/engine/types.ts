@@ -86,9 +86,7 @@ export interface EvidenceReport {
   /** wall-clock cost of the detector portfolio */
   elapsedMs: number;
 }
-
 export type Sensitivity = "low" | "balanced" | "high";
-
 export interface AnalysisSettings {
   sensitivity: Sensitivity;
   /** video only: frames sampled per second (default 2) */
@@ -99,7 +97,6 @@ export interface AnalysisSettings {
   enableMetadata: boolean;
   enableAudio: boolean;
 }
-
 export const DEFAULT_SETTINGS: AnalysisSettings = {
   sensitivity: "balanced",
   frameRate: 2,
@@ -108,9 +105,7 @@ export const DEFAULT_SETTINGS: AnalysisSettings = {
   enableMetadata: true,
   enableAudio: true,
 };
-
 export type CheckStatus = "ok" | "flag" | "warn" | "skip";
-
 export type CheckGroup =
   | "signal"
   | "spectral"
@@ -137,7 +132,6 @@ export interface Check {
   /** plain-English interpretation containing the real measured numbers */
   finding: string;
 }
-
 export interface FaceBox {
   /** normalized to image dimensions, 0..1 */
   x: number;
@@ -145,7 +139,6 @@ export interface FaceBox {
   w: number;
   h: number;
 }
-
 export interface FaceResult {
   index: number;
   box: FaceBox;
@@ -155,7 +148,6 @@ export interface FaceResult {
   confidence: number;
   checks: Check[];
 }
-
 export interface MetadataFindings {
   format: string;
   hasExif: boolean;
@@ -169,7 +161,6 @@ export interface MetadataFindings {
   warnings: string[];
   tags: Record<string, string>;
 }
-
 export interface EngineInfo {
   name: string;
   version: string;
@@ -204,7 +195,6 @@ export interface VerdictBlock {
   inconclusiveReason: string | null;
   explanation: string[];
 }
-
 export interface ImageAnalysis extends VerdictBlock {
   kind: "image";
   checks: Check[];
@@ -218,20 +208,17 @@ export interface ImageAnalysis extends VerdictBlock {
   dimensions: { width: number; height: number };
   hash?: string;
 }
-
 export interface TimelinePoint {
   /** seconds */
   t: number;
   /** 0..1 */
   score: number;
 }
-
 export interface FrameMetrics {
   noise: number;
   luma: number;
   freq: number;
 }
-
 export interface FrameResult {
   index: number;
   t: number;
@@ -240,7 +227,6 @@ export interface FrameResult {
   faces: number;
   metrics: FrameMetrics;
 }
-
 export interface SuspiciousFrame {
   index: number;
   t: number;
@@ -248,7 +234,6 @@ export interface SuspiciousFrame {
   imageId?: string;
   heatId?: string;
 }
-
 export interface TemporalStats {
   /** normalized frame-to-frame noise flicker */
   flicker: number;
@@ -263,7 +248,6 @@ export interface TemporalStats {
   /** fraction of sampled frames with no detectable face */
   noFaceRatio: number;
 }
-
 export interface AudioProfile {
   present: boolean;
   durationSec: number;
@@ -277,7 +261,6 @@ export interface AudioProfile {
   uniformity: number;
   note: string;
 }
-
 export interface VideoAnalysis extends VerdictBlock {
   kind: "video";
   checks: Check[];
@@ -298,16 +281,13 @@ export interface VideoAnalysis extends VerdictBlock {
   dimensions: { width: number; height: number };
   hash?: string;
 }
-
 export type Analysis = ImageAnalysis | VideoAnalysis;
-
 export interface AnalysisArtifacts {
   previewDataUrl?: string;
   heatmapDataUrl?: string;
   elaDataUrl?: string;
   frameArtifacts?: { t: number; score: number; imageDataUrl?: string; heatDataUrl?: string }[];
 }
-
 export interface StageProgress {
   stage:
     | "validating"
@@ -323,3 +303,4 @@ export interface StageProgress {
   pct: number;
   note?: string;
 }
+

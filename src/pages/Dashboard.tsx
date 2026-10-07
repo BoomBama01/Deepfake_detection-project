@@ -217,7 +217,7 @@ export default function Dashboard() {
   const createKey = useMutation(api.apiKeys.create);
   const revokeKey = useMutation(api.apiKeys.revoke);
 
-  const rows = useMemo(() => (scans ?? []) as ScanRow[], [scans]);
+  const rows = useMemo(() => (scans ?? []) as unknown as ScanRow[], [scans]);
 
   /* ---- history filters ---- */
   const [search, setSearch] = useState("");

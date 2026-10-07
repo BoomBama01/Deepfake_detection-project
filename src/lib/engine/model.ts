@@ -1,6 +1,7 @@
 // model.ts
 import { clamp, stdDev } from "./dsp";
-import type { GenerationFeatures, SignalAnalysis } from "./types";
+import type { GenerationFeatures } from "./runner";
+import type { SignalAnalysis } from "./forensics";
 
 export interface ModelMetadata {
   modelId: string;
