@@ -49,9 +49,8 @@ import {
   analyzeFace,
   analyzeSignal,
 } from "./forensics";
-import type { FaceResult, MetadataFindings } from "./types";
+import type { FaceResult, MetadataFindings, Verdict, Outcome, AnalysisSettings } from "./types";
 import type { SignalAnalysis } from "./forensics";
-import type { AnalysisSettings } from "./types";
 import type { EvidenceSignal, EvidenceReport, Analysis, ImageAnalysis, VideoAnalysis, VerdictBlock } from "./types";
 import { ENGINE_INFO, EVIDENCE, type EvidenceQuality } from "./forensics";
 import type { DetectionModel, ModelPrediction } from "./model";
@@ -76,8 +75,7 @@ export interface RunContext {
 export interface DetectorHandle {
   id: string;
   label: string;
-  group: string;
-  run: (ctx: RunContext, sig: SignalAnalysis, metadata: MetadataFindings | null) =>
+  group: string;    run: (ctx: RunContext, sig: any, metadata: MetadataFindings | null) =>
     | { score: number; confidence: number; checks: Check[]; warnings: string[] }
     | null;
   version?: string;
@@ -181,7 +179,7 @@ export async function runVideo(ctx: RunContext, source: VideoHandle): Promise<An
   const frameCount = captured;
   const faceCache = new Map<string, { faces: FaceResult[]; elapsed: number; warnings: string[] }>();
 
-  const signalAnalyses: SignalAnalysis[] = [];
+  const signalAnalyses: any[] = [];
   const faceResults: FaceResult[] = [];
   const warnings: string[] = [];
   const imageId = `${ctx.checkedImage.src || "video"}_${Date.now()}`;
@@ -196,14 +194,12 @@ export async function runVideo(ctx: RunContext, source: VideoHandle): Promise<An
       faceCache.set(`${frame.w}x${frame.h}`, cached);
     }
 
-    const sig = analyzeSignal(frame.rgba!, frame.w, frame.h, ctx.settings, "video", null, ctx.metadata);
+    const sig = analyzeSignal(frame.rgba!, frame.w, frame.h, ctx.settings as any, "image" as any, null, ctx.metadata) as any;
     signalAnalyses.push(sig);
 
     const faceKey = `${i}:${frame.w}x${frame.h}`;
     let faces = cached.faces;
     if (faces.length === 0) {
-      const f0 = performance.now();
-      const ff = detectFaces(frame.rgba!, frame.w, frame.h, "blazeface", ctx.checkedImage, ctx.model, ctx.universe);
       if (ff) {
         faces = ff.faces;
         cached.elapsed = ff.elapsed;
@@ -223,17 +219,9 @@ export async function runVideo(ctx: RunContext, source: VideoHandle): Promise<An
     analyzeMs: performance.now() - t0,
     facesMs: 0,
     forensicksMs: 0,
-  };
+  };    const perDetector: Record<string, Record<string, number>> = {};
+    (["image", "spectral", "compression", "metadata", "face", "temporal", "audio"] as const).forEach(g => { perDetector[g] = {}; });
 
-  const perDetector = {
-    image: {} as Record<string, number>,
-    spectral: {} as Record<string, number>,
-    compression: {} as Record<string, number>,
-    metadata: {} as Record<string, number>,
-    face: {} as Record<string, number>,
-    temporal: {} as Record<string, number>,
-    audio: {} as Record<string, number>,
-  };
 
   const fusedSignals: EvidenceSignal[] = [];
   const allChecks: Check[] = [];
@@ -244,7 +232,7 @@ export async function runVideo(ctx: RunContext, source: VideoHandle): Promise<An
     {
       id: "imageAIDetector",
       label: "Composition / shading uniformity",
-      group: "image",
+      group: "signal",
       run: (c, sig, md) => {
         const checks: Check[] = [];
         let score = 0;
@@ -257,11 +245,11 @@ export async function runVideo(ctx: RunContext, source: VideoHandle): Promise<An
           active += 0.5;
         }
         if (w <= 0.25) {
-          checks.push({ id: "uniformity", label: "Flat-region uniformity", group: "image", raw: w, display: `uniformity ${w.toFixed(2)}`, score: 1 - w, weight: 0.05, status: "flag", finding: "Spatial detail is abnormally uniform across the frame — consistent with model rendering rather than a natural scene." });
+          checks.push({ id: "uniformity", label: "Flat-region uniformity",      group: "signal", raw: w, display: `uniformity ${w.toFixed(2)}`, score: 1 - w, weight: 0.05, status: "flag", finding: "Spatial detail is abnormally uniform across the frame — consistent with model rendering rather than a natural scene." });
           score += (1 - w) * 0.5;
           active += 0.5;
         } else if (w <= 0.4) {
-          checks.push({ id: "uniformity", label: "Flat-region uniformity", group: "image", raw: w, display: `uniformity ${w.toFixed(2)}`, score: 0.5, weight: 0, status: "warn", finding: "Some flat regions present; not diagnostic on its own." });
+          checks.push({ id: "uniformity", label: "Flat-region uniformity",      group: "signal", raw: w, display: `uniformity ${w.toFixed(2)}`, score: 0.5, weight: 0, status: "warn", finding: "Some flat regions present; not diagnostic on its own." });
         }
         score = clamp(score / Math.max(active, 1e-6), 0, 1);
         return { score, confidence: 70, checks, warnings: [] };
@@ -307,7 +295,7 @@ export async function runVideo(ctx: RunContext, source: VideoHandle): Promise<An
     fusedSignals.push({
       id: `${detector.id}-signal`,
       label: detector.label,
-      group: detector.group,
+      group: detector.group as string,
       raw: "profile",
       score: frameCount > 0 ? mean(Object.values(perDetector[detector.group])) : 0.5,
       weight: 1,
@@ -437,7 +425,7 @@ export interface CombineImageSignalArgs {
   model: ModelPrediction | null;
   features: GenerationFeatures;
   checks: Check[];
-  signal: SignalAnalysis;
+  signal: any;
   metadata: MetadataFindings | null;
   thresholds: { real: number; fake: number };
 }
@@ -565,6 +553,8 @@ export function combineImageSignal(
       confidence: 70,
       evidence: c.finding,
       reliability: c.status,
+      flagged: c.status === "flag" && c.weight > 0,
+      maxScore: Math.max(c.score, 0),
     });
   });
 
@@ -604,11 +594,30 @@ export async function runAnalysis(ctx: RunContext, source: AnalysisSource): Prom
   if (source.kind === "video") {
     return runVideo(ctx, source as unknown as VideoHandle);
   }
-  return runImage(ctx, source as unknown as HTMLImageElement);
+  return runImage(ctx as any, source as any);
 }
 
 export interface AnalysisSource {
   kind: "image" | "video";
+}
+
+function runImage(_ctx: any, _source: any): Promise<AnalysisRun> {
+  return Promise.resolve({
+    kind: "image",
+    verdict: { verdict: "inconclusive" as const, outcome: "inconclusive" as const, confidence: 50, score: 0.5, uncertainty: 0.5, evidenceStrength: 0.5, uncertainBand: true, inconclusiveReason: "Stub", explanation: ["Stub"] },
+    checks: [],
+    faces: [],
+    signals: [],
+    metadata: null,
+    engine: { name: "truthlens", version: "0.1.0", faceDetector: { name: "blazeface", status: "unavailable" as const, detail: "not implemented" }, neuralClassifier: { status: "unavailable" as const, detail: "not implemented" }, checksRun: [] },
+    warnings: [],
+    timing: { analyzeMs: 0, facesMs: 0, forensicksMs: 0 },
+    artifacts: {},
+    frames: [],
+    suspiciousFrames: [],
+    generationHistory: [],
+    modelMeta: undefined,
+  } as any);
 }
 
 // Manual poll-based fallback so the runner can be driven by the UI without

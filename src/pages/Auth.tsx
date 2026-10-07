@@ -202,7 +202,7 @@ function Auth({ redirectAfterAuth }: AuthProps = {}) {
                     <div className="flex justify-center">
                       <InputOTP
                         value={otp}
-                        onChange={setOtp}
+                        onChange={(e: any) => setOtp(e.currentTarget?.value || e)}
                         maxLength={6}
                         disabled={isLoading}
                         onKeyDown={(e) => {

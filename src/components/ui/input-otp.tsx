@@ -1,10 +1,18 @@
 import * as React from "react";
 import { cn } from "./button";
 
-const InputOTP = React.forwardRef<
-  HTMLDivElement,
-  React.ComponentPropsWithoutRef<"div">
->(({ className, ...props }, ref) => (
+interface InputOTPProps {
+  className?: string;
+  children?: React.ReactNode;
+  value?: string;
+  onChange?: (value: string) => void;
+  maxLength?: number;
+  disabled?: boolean;
+  onKeyDown?: (e: React.KeyboardEvent) => void;
+}
+
+const InputOTP = React.forwardRef<HTMLDivElement, InputOTPProps>(
+  ({ className, children, value, onChange, maxLength, disabled, onKeyDown, ...props }, ref) => (
   <div
     ref={ref}
     className={cn(
@@ -64,11 +72,6 @@ const InputOTPSlot = React.forwardRef<
       )}
       onClick={(e) => {
         (e.target as HTMLInputElement).select();
-      }}
-      onChange={(e) => {
-        const val = e.target.value;
-        setValue(val);
-        props.onChange?.(val);
       }}
       value={value}
     />

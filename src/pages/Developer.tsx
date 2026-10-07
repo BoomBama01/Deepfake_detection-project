@@ -76,7 +76,7 @@ export default function Developer() {
 
   /* live stats from this account's own scans — nothing leaves the browser */
   const stats = useMemo(() => {
-    const rows = (scans ?? []) as ScanRow[];
+    const rows = (scans ?? []) as unknown as ScanRow[];
     const withConf = rows.filter((r) => r.confidence != null);
     const withUnc = rows.filter((r) => r.uncertainty != null);
     const withEv = rows.filter((r) => r.evidenceStrength != null);
