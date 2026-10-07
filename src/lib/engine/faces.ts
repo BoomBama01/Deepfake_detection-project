@@ -45,7 +45,7 @@ export interface FaceDetection {
 }
 
 /** Detect faces on a drawable source; boxes are normalised to 0..1. */
-export async function detectFaces(
+export async function detectFacesCore(
   source: HTMLCanvasElement | ImageBitmap | HTMLImageElement,
   width: number,
   height: number,
@@ -90,4 +90,33 @@ export function iou(a: FaceBox, b: FaceBox): number {
 
 export function centerOf(b: FaceBox): { x: number; y: number } {
   return { x: b.x + b.w / 2, y: b.y + b.h / 2 };
+}
+
+/**
+ * Runner-friendly face-detection wrapper.
+ *
+ * Returns the shape the video pipeline expects ({ faces, elapsed, warnings })
+ * so runner.ts can call detectFaces with the same arity it uses everywhere.
+ */
+export async function detectFaces(
+  source: HTMLCanvasElement | ImageBitmap | HTMLImageElement,
+  width: number,
+  height: number,
+  _settings: unknown,
+  _metadata: unknown,
+): Promise<{ faces: FaceDetection[]; elapsed: number; warnings: string[] }> {
+  const t0 = performance.now();
+  let faces: FaceDetection[];
+  const warnings: string[] = [];
+  try {
+    faces = await detectFacesCore(source, width, height);
+  } catch (err) {
+    warnings.push(
+      err instanceof FaceDetectorUnavailableError
+        ? err.message
+        : `Face detection failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    faces = [];
+  }
+  return { faces, elapsed: performance.now() - t0, warnings };
 }

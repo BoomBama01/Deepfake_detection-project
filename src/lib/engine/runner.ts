@@ -200,13 +200,18 @@ export async function runVideo(ctx: RunContext, source: VideoHandle): Promise<An
     const faceKey = `${i}:${frame.w}x${frame.h}`;
     let faces = cached.faces;
     if (faces.length === 0) {
-      if (ff) {
-        faces = ff.faces;
-        cached.elapsed = ff.elapsed;
-        cached.warnings = ff.warnings;
-      }
+      const ff = await detectFaces(ctx.checkedImage, frame.w, frame.h, ctx.settings, ctx.metadata);
+      faces = ff.faces.map((fd, idx) => ({
+        index: idx,
+        box: fd.box,
+        score: fd.score,
+        confidence: Math.round(fd.score * 100),
+        checks: [],
+      }));
+      cached.elapsed = ff.elapsed;
+      cached.warnings = ff.warnings;
       faceResults.push(...faces);
-      faceCache.set(faceKey, { faces, elapsed: 0, warnings: [] });
+      faceCache.set(faceKey, { faces, elapsed: ff.elapsed, warnings: ff.warnings });
     }
 
     const quality = evidenceQuality(sig.sharpness, ctx.metadata);
@@ -238,7 +243,7 @@ export async function runVideo(ctx: RunContext, source: VideoHandle): Promise<An
         let score = 0;
         let active = 0;
         const w = 1 - clamp(stdDev(sig.tiles.grad) / (mean(sig.tiles.grad) + 1e-6), 0, 1);
-        const ela = sig.checks.find((c2) => c2.id === "ela");
+        const ela = sig.checks.find((c2: Check) => c2.id === "ela");
         if (ela && ela.score >= 0.65) {
           checks.push(ela);
           score += ela.score * 0.5;
@@ -264,7 +269,7 @@ export async function runVideo(ctx: RunContext, source: VideoHandle): Promise<An
         const checks: Check[] = [];
         let score = 0;
         let active = 0;
-        const spectrum = sig.checks.find((c2) => c2.id === "spectrum");
+        const spectrum = sig.checks.find((c2: Check) => c2.id === "spectrum");
         if (spectrum) {
           checks.push(spectrum);
           score += spectrum.score * 0.5;
@@ -321,15 +326,14 @@ export async function runVideo(ctx: RunContext, source: VideoHandle): Promise<An
 
   const imageFusion = combineImageSignal(
     ctx.modelPrediction,
-    fusion.signals.map((s) => s),
     signalAnalyses.map((s) => s.checks),
-    signalAnalyses[0],
+    signalAnalyses[0] as SignalAnalysis,
     ctx.metadata,
     ctx.modelMetadata.thresholds,
-  );
+  ) as FusionOutcome;
 
   // Face detector over the full clip (or a representative subset).
-  const faceHandle: FaceHandle = {
+  const faceHandle: VideoHandle = {
     durationSec: source.durationSec,
     width: source.width,
     height: source.height,
@@ -341,7 +345,7 @@ export async function runVideo(ctx: RunContext, source: VideoHandle): Promise<An
   };
 
   // Temporal & audio pipelines
-  const temporal = {
+  const temporal: { flicker: number; scoreCv: number; lightJumps: number; cuts: number; faceJitter: number; noFaceRatio: number } = {
     flicker: 0,
     scoreCv: 0,
     lightJumps: 0,
@@ -406,8 +410,8 @@ export function buildGenerationFeatures(checks: Check[], signals: { grid: number
   const faceLean = faceCheck ? clamp(faceCheck.raw, 0, 1) : 0.05;
 
   const noiseSmoothness = 1 - clamp(stdDev(checks.map((c) => c.score)) / 0.4, 0, 1);
-  const spectralAnomaly = 1 - clamp(1 - signals[0]?.spectralAnomaly ?? 0, 0, 1);
-  const upsamplingPeak = signals[0]?.upsamplingPeak ?? 0.15;
+  const spectralAnomaly = 1 - clamp(1 - 0, 0, 1);
+  const upsamplingPeak = 0.15;
 
   return {
     noiseSmoothness,
@@ -532,18 +536,17 @@ export function combineImageSignal(
   }
 
   const signals: EvidenceSignal[] = [];
-  const categories: { id: string; label: string; flags: boolean; maxScore: number; weight: number; signals: EvidenceSignal[] }[] = [];
+  const categories: { id: string; label: string; flagged: boolean; maxScore: number; weight: number; signals: EvidenceSignal[] }[] = [];
   const groups = new Set<string>();
   w.forEach((c) => {
     groups.add(c.group);
     const cat = categories.find((g) => g.id === c.group);
     if (!cat) {
-      categories.push({ id: c.group, label: c.label, flags: false, maxScore: c.score, weight: c.weight, signals: [] });
+      categories.push({ id: c.group, label: c.label, flagged: false, maxScore: c.score, weight: c.weight, signals: [] });
     }
   });
   w.forEach((c) => {
-    const cat = categories.find((g) => g.id === c.group)!;
-    cat.signals.push({
+    const cat = categories.find((g) => g.id === c.group)!;      cat.signals.push({
       id: c.id,
       label: c.label,
       group: c.group,
@@ -553,7 +556,6 @@ export function combineImageSignal(
       confidence: 70,
       evidence: c.finding,
       reliability: c.status,
-      flagged: c.status === "flag" && c.weight > 0,
       maxScore: Math.max(c.score, 0),
     });
   });

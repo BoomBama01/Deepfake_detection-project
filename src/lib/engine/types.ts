@@ -40,6 +40,8 @@ export interface EvidenceSignal {
   weight: number;
   /** 0..100 confidence in this signal */
   confidence: number;
+  /** top synthetic-leaning score observed for this signal */
+  maxScore?: number;
   /** plain-English evidence quoting the real measured numbers */
   evidence: string;
   /** "skip" | "not-applicable" | "ok" | "warn" | "flag" */
