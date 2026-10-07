@@ -1,5 +1,5 @@
 import { v } from "convex/values";
-import { query, mutation, type ActionCtx } from "./_generated/server";
+import { query, mutation, internalQuery } from "./_generated/server";
 import { getAuthUserId } from "@convex-dev/auth/server";
 import { auth } from "./auth";
 import { verdictValidator } from "./schema";
@@ -33,7 +33,7 @@ export const add = mutation({
       fileName: args.fileName,
       fileHash: args.fileHash,
       fileSize: args.fileSize,
-      status: "done",
+      status: "done" as const,
       verdict: args.verdict,
       confidence: args.confidence,
       settings: args.settings,
@@ -42,7 +42,7 @@ export const add = mutation({
       createdAt: now,
       expiresAt,
     };
-    return ctx.db.insert("scans", doc);
+    return ctx.db.insert("scans", doc as any);
   },
 });
 
@@ -83,7 +83,7 @@ export const getPublicById = query({
 // ---- internal helpers for the read-only REST API (http.ts) ----
 
 /** List every scan this account owns, most recent first. For the public API. */
-export const apiListFor = query({
+export const apiListFor = internalQuery({
   args: { userId: v.id("users") },
   handler: (ctx, args) =>
     ctx.db
@@ -94,19 +94,19 @@ export const apiListFor = query({
 });
 
 /** Look up a single scan by id and re-check that it belongs to the requester. */
-export const apiGetFor = query({
+export const apiGetFor = internalQuery({
   args: { userId: v.id("users"), scanId: v.id("scans") },
-  handler: (ctx, args) => {
-    const doc = ctx.db.get(args.scanId);
+  handler: async (ctx, args) => {
+    const doc = await ctx.db.get(args.scanId);
     if (!doc) return { status: "missing" as const, scan: null as any, message: "not found" };
-    if (doc.userId !== args.userId) {
+    if ((doc as any).userId !== args.userId) {
       return { status: "forbidden" as const, scan: null as any, message: "belongs to another account" };
     }
-    return { status: "ok" as const, scan: doc, message: "owned" };
+    return { status: "ok" as const, scan: doc as any, message: "owned" };
   },
 });
 
-/** Current-day scan use for the guest quota (device-scoped). */
+/** Current-day scan count for the guest quota (device-scoped). */
 export const apiQuotaFor = query({
   args: { userId: v.optional(v.id("users")) },
   handler: async (ctx, args) => {
@@ -115,15 +115,15 @@ export const apiQuotaFor = query({
     const today = new Date();
     today.setUTCHours(0, 0, 0, 0);
     const day = today.toISOString().slice(0, 10);
-    const now = Math.floor(Date.now() / 1000);
     let existing = await ctx.db
       .query("guestQuota")
-      .withIndex("by_device_day", (q) => q.eq("day", day))
+      .withIndex("by_device_day", (q) => q.eq("deviceId", userId).eq("day", day))
       .unique();
     if (!existing) {
-      existing = await ctx.db.insert("guestQuota", { deviceId: "", day, count: 0 });
+      // read-only path: caller should have seeded this via mutation before reading
+      return { used: 0, limit: 2 };
     }
-    const used = existing.count ?? 0;
+    const used = (existing as any).count ?? 0;
     const limit = 2;
     return { used, limit };
   },

@@ -1,1 +1,0 @@
-components/ui/resizable.tsx

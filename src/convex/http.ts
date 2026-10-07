@@ -94,14 +94,20 @@ http.route({
   method: "GET",
   handler: httpAction(async (ctx, req) => {
     const authResult = await requireKey(ctx, req);
-    if ("error" in authResult) return authResult.error;
+    if ("error" in authResult) {
+      return authResult.error;
+    }
 
-    const quota = await ctx.runQuery(internal.scans.apiQuotaFor, {
+    const quota = await ctx.runQuery(internal.scans.apiListFor, {
       userId: authResult.userId,
     });
-    return json(quota, 200, {
-      "X-RateLimit-Remaining": String(authResult.remaining),
-    });
+    const used = Array.isArray(quota) ? quota.length : 0;
+    const limit = 2;
+    return json(
+      { used, limit },
+      200,
+      { "X-RateLimit-Remaining": String(authResult.remaining) },
+    );
   }),
 });
 
@@ -116,7 +122,9 @@ http.route({
   method: "GET",
   handler: httpAction(async (ctx, req) => {
     const authResult = await requireKey(ctx, req);
-    if ("error" in authResult) return authResult.error;
+    if ("error" in authResult) {
+      return authResult.error;
+    }
 
     const scans = await ctx.runQuery(internal.scans.apiListFor, {
       userId: authResult.userId,
@@ -132,7 +140,9 @@ http.route({
   method: "GET",
   handler: httpAction(async (ctx, req) => {
     const authResult = await requireKey(ctx, req);
-    if ("error" in authResult) return authResult.error;
+    if ("error" in authResult) {
+      return authResult.error;
+    }
     const rateHeaders = {
       "X-RateLimit-Remaining": String(authResult.remaining),
     };
@@ -141,7 +151,7 @@ http.route({
     const scanId = url.pathname.slice(SCANS_PATH.length + 1);
     const detail = await ctx.runQuery(internal.scans.apiGetFor, {
       userId: authResult.userId,
-      scanId,
+      scanId: scanId as any,
     });
     if (detail.status === "missing") {
       return json({ error: "Scan not found." }, 404, rateHeaders);
