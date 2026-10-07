@@ -16,6 +16,25 @@ then throws:
 
 ## What we configured
 
+### 0. The production server (`main.ts`, Deno + Hono)
+
+The app's own server at the repository root implements all four rules:
+
+- `/assets/*` is served from `./dist` with
+  `Cache-Control: public, max-age=31536000, immutable`, and a **hard 404** when
+  the file does not exist (an explicit `app.all("/assets/*")` 404 route runs
+  before any SPA fallback — previously a missing chunk fell through to
+  `index.html` with status 200, which is the direct cause of
+  "Failed to fetch dynamically imported module").
+- The SPA shell (`dist/index.html`) is served only for extension-less page
+  routes, always with `Cache-Control: no-cache, no-store, must-revalidate`.
+- Missing files whose path ends in an extension (`/missing.json`,
+  `/assets/gone.js`) return 404 instead of HTML.
+
+These rules were verified end-to-end by driving the server's `app.fetch` against
+the real `dist/` output (root/page routes uncached, chunks immutable, missing
+chunk 404).
+
 ### 1. The shell page is not cached
 
 `index.html` (and `/` served as `index.html`) must be cache-inert so the browser
@@ -77,8 +96,12 @@ of defense in `src/main.tsx`:
 
 ## Choosing which config file to use
 
-Drop only the file that matches your host into the repository root before deployment.
-They are not cumulative — pick one.
+`main.ts` is the app's own production server — if your host runs it, you need no
+other file from this list.
+
+If you instead host `dist/` on another platform, drop only the file that matches
+your host into the repository root before deployment. They are not cumulative —
+pick one.
 
 - **Vercel**: keep `vercel.json` and remove the others.
 - **Netlify**: keep `netlify.toml` and remove the others.
