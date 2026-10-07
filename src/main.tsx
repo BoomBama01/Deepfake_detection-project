@@ -9,20 +9,85 @@ import { createRoot } from "react-dom/client";
 import { BrowserRouter, Route, Routes, useLocation } from "react-router";
 import "./index.css";
 
-// Lazy load route components for better code splitting
-const Landing = lazy(() => import("./pages/Landing.tsx"));
-const AuthPage = lazy(() => import("./pages/Auth.tsx"));
-const Analyze = lazy(() => import("./pages/Analyze.tsx"));
-const Results = lazy(() => import("./pages/Results.tsx"));
-const Dashboard = lazy(() => import("./pages/Dashboard.tsx"));
-const Developer = lazy(() => import("./pages/Developer.tsx"));
-const Docs = lazy(() => import("./pages/Docs.tsx"));
-const Learn = lazy(() => import("./pages/Learn.tsx"));
-const About = lazy(() => import("./pages/About.tsx"));
-const Privacy = lazy(() => import("./pages/Privacy.tsx"));
-const Terms = lazy(() => import("./pages/Terms.tsx"));
-const Contact = lazy(() => import("./pages/Contact.tsx"));
-const NotFound = lazy(() => import("./pages/NotFound.tsx"));
+// React.lazy chunk loader with redeploy resilience.
+// After a deploy the browser may be handed a stale index.html route handler that
+// returns 200 for a now-missing /assets/* chunk, so dynamic imports can fail with a
+// "Failed to fetch dynamically imported module" Vite error. We:
+//  - listen for Vite's preloadError event and hard-reload the page,
+//  - wrap every lazy() import in a retry loader (2 attempts) and then, once, reload
+//    the page while a sessionStorage flag prevents a reload loop.
+async function retryLazyImportDeferred(
+  importFn: () => Promise<{ default: React.ComponentType<{}> }>,
+  key: string,
+  reloadOnFailure: boolean,
+): Promise<React.ComponentType<{}>> {
+  const sessionKey = `truthlens.lazy.${key}.attempted`;
+  const alreadyReloaded = () => {
+    try { return sessionStorage.getItem(sessionKey) === "reloaded"; } catch { return false; }
+  };
+  const markAttempted = () => {
+    try { sessionStorage.setItem(sessionKey, "attempted"); } catch { /* ignore */ }
+  };
+  const markReloaded = () => {
+    try { sessionStorage.setItem(sessionKey, "reloaded"); } catch { /* ignore */ }
+  };
+  const clearState = () => {
+    try { sessionStorage.removeItem(sessionKey); } catch { /* ignore */ }
+  };
+
+  markAttempted();
+  let lastError: unknown = null;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const mod = await importFn();
+      if (typeof mod.default !== "function")
+        throw new Error(`Lazy module ${key} has no default export`);
+      clearState();
+      return mod.default;
+    } catch (err) {
+      lastError = err;
+      if (attempt < 2) {
+        await new Promise((r) => setTimeout(r, 700));
+      }
+    }
+  }
+
+  console.warn(
+    `[truthlens] Lazy chunk failed after 2 attempts for ${key}.`,
+    lastError instanceof Error ? lastError.message : lastError,
+  );
+
+  if (reloadOnFailure && !alreadyReloaded()) {
+    markReloaded();
+    window.location.reload();
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return ((React as any).Fragment) as any;
+}
+
+function lazyWithRetry(
+  key: string,
+  importFn: () => Promise<{ default: React.ComponentType<{}> }>,
+): React.LazyExoticComponent<React.ComponentType<Record<string, never>>> {
+  // Cast through unknown to satisfy React's strict Lazy loader return type while
+  // keeping our internal retry loader typed around the default export.
+  return React.lazy(() => retryLazyImportDeferred(importFn, key, true) as unknown as Promise<{ default: React.ComponentType<Record<string, never>> }>);
+}
+
+const Landing = lazyWithRetry("Landing", () => import("./pages/Landing.tsx"));
+const AuthPage = lazyWithRetry("Auth", () => import("./pages/Auth.tsx"));
+const Analyze = lazyWithRetry("Analyze", () => import("./pages/Analyze.tsx"));
+const Results = lazyWithRetry("Results", () => import("./pages/Results.tsx"));
+const Dashboard = lazyWithRetry("Dashboard", () => import("./pages/Dashboard.tsx"));
+const Developer = lazyWithRetry("Developer", () => import("./pages/Developer.tsx"));
+const Docs = lazyWithRetry("Docs", () => import("./pages/Docs.tsx"));
+const Learn = lazyWithRetry("Learn", () => import("./pages/Learn.tsx"));
+const About = lazyWithRetry("About", () => import("./pages/About.tsx"));
+const Privacy = lazyWithRetry("Privacy", () => import("./pages/Privacy.tsx"));
+const Terms = lazyWithRetry("Terms", () => import("./pages/Terms.tsx"));
+const Contact = lazyWithRetry("Contact", () => import("./pages/Contact.tsx"));
+const NotFound = lazyWithRetry("NotFound", () => import("./pages/NotFound.tsx"));
 
 // Simple loading fallback for route transitions
 function RouteLoading() {
@@ -91,7 +156,21 @@ class RootErrorBoundary extends React.Component<
 
 const convex = new ConvexReactClient(import.meta.env.VITE_CONVEX_URL as string);
 
-
+// Global reload guard for Vite chunk-load failures.
+// This catches both Vite's own preloadError and any dynamic import that throws,
+// then reloads the page so the browser picks up the freshly deployed hashed chunks.
+window.addEventListener(
+  "vite:preloadError",
+  () => {
+    try {
+      sessionStorage.setItem("truthlens.preloadError.reload", "1");
+    } catch {
+      /* ignore */
+    }
+    window.location.reload();
+  },
+  { once: false },
+);
 
 function RouteSyncer() {
   const location = useLocation();
@@ -116,7 +195,6 @@ function RouteSyncer() {
   return null;
 }
 
-
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
     <RootErrorBoundary>
@@ -131,7 +209,7 @@ createRoot(document.getElementById("root")!).render(
               <Route path="/" element={<Landing />} />
               <Route
                 path="/auth"
-                element={<AuthPage redirectAfterAuth="/dashboard" />}
+                element={<AuthPage />}
               />
               <Route path="/analyze" element={<Analyze />} />
               <Route path="/results/:id" element={<Results />} />

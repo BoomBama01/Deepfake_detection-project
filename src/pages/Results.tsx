@@ -173,7 +173,7 @@ export default function Results() {
             {scan.status === "error" ? "Analysis unavailable" : "Not yet analysed"}
           </h1>
           <p className="mt-3 font-body text-sm leading-6 text-muted-foreground">
-            {scan.note ??
+            {scan.note ?? 
               (scan.status === "error"
                 ? "This scan did not complete. Try re-analysing the file."
                 : "This scan has not been processed yet.")}
@@ -235,7 +235,9 @@ export default function Results() {
 
   const copyLink = async () => {
     try {
-      if (!scan.isPublic)          await setVisibility({ id: id as Id<"scans">, isPublic: true });
+      if (!scan.isPublic) {
+        await setVisibility({ id: id as Id<"scans">, isPublic: true });
+      }
       await navigator.clipboard.writeText(shareUrl);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
