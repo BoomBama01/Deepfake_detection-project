@@ -95,17 +95,16 @@ export function checkSize(kind: MediaKind, size: number, requestId: string): voi
 }
 
 export function auditStart(requestId: string, caller: string, kind: MediaKind, fileName: string, fileSize: number, contentType: string): string {
-  const entry: AuditLog = { requestId, caller, kind, fileName, fileSize, contentType, verdict: "pending", ts: Date.now() };
+  const entry: AuditLog = { requestId, caller, kind, fileName, fileSize, contentType, verdict: "pending", elapsedMs: 0, ts: Date.now() };
   console.log(log(entry));
   return requestId;
+}export function auditComplete(entry: Omit<AuditLog, "ts"> & { elapsedMs: number }): void {
+  const e: AuditLog = { ...entry, ts: Date.now(), elapsedMs: entry.elapsedMs };
+  console.log(log(e));
 }
-
-export function auditComplete(entry: Omit<AuditLog, "ts"> & { elapsedMs: number }): void {
-  auditLog({ ts: Date.now(), elapsedMs: entry.elapsedMs, ...entry });
-}
-
 export function auditError(requestId: string, caller: string, kind: MediaKind, stage: string, error: string, fileSize: number = 0, fileName: string = "", contentType: string = "unknown"): void {
-  auditLog({ requestId, caller, kind, fileName, fileSize, contentType, verdict: "error", stage, error, elapsedMs: 0, ts: Date.now() });
+  const e: AuditLog = { requestId, caller, kind, fileName, fileSize, contentType, verdict: "error", elapsedMs: 0, error, ts: Date.now() };
+  console.log(log(e));
 }
 
 export function auditLog(entry: AuditLog): void {

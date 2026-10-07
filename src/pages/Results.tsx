@@ -52,7 +52,13 @@ import { buildReport } from "@/lib/engine/report";
 import { formatDate, formatDuration } from "@/lib/format";
 
 type ResultsQuery = ReturnType<typeof useQuery<typeof api.scans.get>>;
-type Scan = Exclude<ResultsQuery, undefined | null>;
+type Scan = Exclude<ResultsQuery, undefined | null> & {
+  previewUrl?: string | null;
+  heatmapUrl?: string | null;
+  elaUrl?: string | null;
+  mediaExpired?: boolean;
+  frameUrls?: Array<{ t: number; imageUrl?: string; heatUrl?: string }>;
+};
 
 const VALID_ID = /^[a-zA-Z0-9_-]{20,}$/;
 
@@ -177,7 +183,7 @@ export default function Results() {
 
   const copyLink = async () => {
     try {
-      if (!scan.isPublic) await setVisibility({ id: id as Id<"scans">, isPublic: true, deviceId });
+      if (!scan.isPublic)          await setVisibility({ id: id as Id<"scans">, isPublic: true });
       await navigator.clipboard.writeText(shareUrl);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
@@ -284,7 +290,7 @@ export default function Results() {
               id="public-toggle"
               checked={scan.isPublic}
               onCheckedChange={(v) =>
-                void setVisibility({ id: id as Id<"scans">, isPublic: v, deviceId }).catch(
+                void setVisibility({ id: id as Id<"scans">, isPublic: v }).catch(
                   (e) => toast.error(String(e)),
                 )
               }
@@ -299,7 +305,7 @@ export default function Results() {
               id="pin-toggle"
               checked={scan.pinned}
               onCheckedChange={(v) =>
-                void setPinned({ id: id as Id<"scans">, pinned: v, deviceId }).catch((e) =>
+                void setPinned({ id: id as Id<"scans">, pinned: v }).catch((e) =>
                   toast.error(String(e)),
                 )
               }
@@ -329,7 +335,7 @@ export default function Results() {
                 <AlertDialogCancel>Keep it</AlertDialogCancel>
                 <AlertDialogAction
                   onClick={async () => {
-                    await removeScan({ id: id as Id<"scans">, deviceId });
+                    await removeScan({ id: id as Id<"scans"> });
                     toast.success("Result deleted.");
                     window.location.href = "/dashboard";
                   }}

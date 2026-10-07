@@ -6,6 +6,42 @@
 // detectors disagree, the run comes back `inconclusive`: a hedge that
 // never claims a false Real or a false likely_deepfake.
 import { clamp, stdDev, mean } from "./dsp";
+// Errors thrown by the runner when the engine can't proceed.
+export class AnalysisError extends Error {
+  constructor(
+    message: string,
+    public readonly code: string,
+    public readonly details?: unknown,
+  ) {
+    super(message);
+    this.name = "AnalysisError";
+  }
+}
+
+// Limits enforced by the runner.
+export const LIMITS = {
+  maxFileSize: 50 * 1024 * 1024, // 50 MB
+  imageMaxBytes: 15 * 1024 * 1024, // 15 MB
+  videoMaxBytes: 200 * 1024 * 1024, // 200 MB
+  videoMaxSeconds: 180, // 3 minutes
+  batchMax: 10,
+  maxDimensions: { width: 12000, height: 12000 },
+  minDimensions: { width: 16, height: 16 },
+  maxFrames: 90,
+  minFrames: 12,
+  frameRate: 2,
+  supportedMimeTypes: [
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+    "image/bmp",
+    "image/tiff",
+    "video/mp4",
+    "video/webm",
+    "video/ogg",
+  ] as const,
+} as const;
+
 import {
   evidenceQuality,
   combineChecks,

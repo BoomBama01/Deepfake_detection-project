@@ -1,21 +1,20 @@
 import { Toaster as Sonner } from "sonner";
+import * as React from "react";
+import { cn } from "./button";
 
-type ToasterProps = React.ComponentProps<typeof Sonner>;
-
-const Toaster = ({ ...props }: ToasterProps) => {
-  return (
-    <Sonner
-      classNames={{
-        toast: "cursor-pointer group",
-        description: "text-muted-foreground group-hover:text-foreground",
-        actionButton:
-          "data-[state=loading]:text-muted-foreground group-data-[variant=default]:text-primary group-data-[variant=success]:text-green-500 group-data-[variant=error]:text-destructive",
-        cancelButton:
-          "data-[state=loading]:text-muted-foreground group-data-[variant=default]:text-muted-foreground group-data-[variant=success]:text-muted-foreground group-data-[variant=error]:text-muted-foreground",
-      }}
-      {...props}
-    />
-  );
-};
+const Toaster = React.forwardRef<
+  React.ElementRef<typeof Sonner>,
+  React.ComponentPropsWithoutRef<typeof Sonner>
+>(({ className, ...props }, ref) => (
+  <Sonner
+    ref={ref}
+    className={cn(
+      "toaster group",
+      className
+    )}
+    {...props}
+  />
+));
+Toaster.displayName = "Toaster";
 
 export { Toaster };

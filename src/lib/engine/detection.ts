@@ -5,9 +5,10 @@
 // `combineImageSignal` means "measurements only, no model": that is the
 // honest default for a detector portfolio that is measured, capped at 97%
 // confidence and inconclusive when the evidence is degraded.
-import type { Check, GenerationFeatures, MetadataFindings, SignalAnalysis, SignalAnalysisType, Verdict } from "./types";
+import type { Check, MetadataFindings, Verdict } from "./types";
 import { EVIDENCE, evidenceQuality } from "./forensics";
 import type { ModelPrediction } from "./model";
+import type { GenerationFeatures, SignalAnalysis } from "./runner";
 import {
   combineImageSignal,
   buildGenerationFeatures,

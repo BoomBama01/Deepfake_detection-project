@@ -42,24 +42,24 @@ export { AspectRatio } from "./aspect-ratio"; // ~1KB - Maintain aspect ratios
 // Navigation
 export { Breadcrumb, BreadcrumbList, BreadcrumbItem, BreadcrumbLink, BreadcrumbPage, BreadcrumbSeparator, BreadcrumbEllipsis } from "./breadcrumb"; // ~4KB
 export { Tabs, TabsList, TabsTrigger, TabsContent } from "./tabs"; // ~5KB - Tab navigation
-export { NavigationMenu, NavigationMenuList, NavigationMenuItem, NavigationMenuTrigger, NavigationMenuContent, NavigationMenuLink, NavigationMenuIndicator, NavigationMenuViewport, navigationMenuTriggerStyle } from "./navigation-menu"; // ~8KB
+export { NavigationMenu, NavigationMenuContent, NavigationMenuItem, NavigationMenuLink, NavigationMenuButton as NavigationMenuTrigger, NavigationMenuIndicator, NavigationMenuViewport } from "./navigation-menu"; // ~8KB
 
 // Overlays & Dialogs
 export { Tooltip, TooltipTrigger, TooltipContent, TooltipProvider } from "./tooltip"; // ~4KB - Hover tooltips
-export { Popover, PopoverTrigger, PopoverContent } from "./popover"; // ~5KB - Floating popovers
+export { Popover, PopoverTrigger, PopoverContent, PopoverAnchor } from "./popover"; // ~5KB - Floating popovers
 export { HoverCard, HoverCardTrigger, HoverCardContent } from "./hover-card"; // ~5KB - Hover cards
-export { Dialog, DialogTrigger, DialogContent, DialogHeader, DialogFooter, DialogTitle, DialogDescription } from "./dialog"; // ~6KB - Modal dialogs
-export { Sheet, SheetTrigger, SheetContent, SheetHeader, SheetFooter, SheetTitle, SheetDescription } from "./sheet"; // ~6KB - Side sheets
+export { Dialog, DialogTrigger, DialogContent, DialogHeader, DialogFooter, DialogTitle, DialogDescription, DialogClose } from "./dialog"; // ~6KB - Modal dialogs
+export { Sheet, SheetTrigger, SheetContent, SheetHeader, SheetFooter, SheetTitle, SheetDescription, SheetClose } from "./sheet"; // ~6KB - Side sheets
 export { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, AlertDialogTrigger } from "./alert-dialog"; // ~6KB
 
 // Menus & Dropdowns
 export { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuCheckboxItem, DropdownMenuRadioItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuShortcut, DropdownMenuGroup, DropdownMenuPortal, DropdownMenuSub, DropdownMenuSubContent, DropdownMenuSubTrigger, DropdownMenuRadioGroup } from "./dropdown-menu"; // ~7KB
-export { ContextMenu, ContextMenuTrigger, ContextMenuContent, ContextMenuItem, ContextMenuCheckboxItem, ContextMenuRadioItem, ContextMenuLabel, ContextMenuSeparator, ContextMenuShortcut, ContextMenuGroup, ContextMenuPortal, ContextMenuSub, ContextMenuSubContent, ContextMenuSubTrigger, ContextMenuRadioGroup } from "./context-menu"; // ~7KB
+export { ContextMenu, ContextMenuTrigger, ContextMenuContent, ContextMenuItem, ContextMenuCheckboxItem, ContextMenuRadioItem, ContextMenuLabel, ContextMenuSeparator, ContextMenuShortcut } from "./context-menu"; // ~7KB
 export { Menubar, MenubarMenu, MenubarTrigger, MenubarContent, MenubarItem, MenubarSeparator, MenubarLabel, MenubarCheckboxItem, MenubarRadioGroup, MenubarRadioItem, MenubarPortal, MenubarSubContent, MenubarSubTrigger, MenubarGroup, MenubarSub, MenubarShortcut } from "./menubar"; // ~8KB
 
 // Form Components
-export { Select, SelectGroup, SelectValue, SelectTrigger, SelectContent, SelectLabel, SelectItem, SelectSeparator, SelectScrollUpButton, SelectScrollDownButton } from "./select"; // ~6KB - Dropdown select
-export { Form, FormItem, FormLabel, FormControl, FormDescription, FormMessage, FormField } from "./form"; // ~4KB - Form wrapper with validation
+export { Select, SelectGroup, SelectValue, SelectTrigger, SelectContent, SelectLabel, SelectItem, SelectSeparator } from "./select"; // ~6KB - Dropdown select
+export { Form, FormItem, FormLabel, FormControl, FormDescription, FormMessage } from "./form"; // ~4KB - Form wrapper with validation
 export { InputOTP, InputOTPGroup, InputOTPSlot, InputOTPSeparator } from "./input-otp"; // ~5KB - OTP input
 
 // Content Display
@@ -77,17 +77,17 @@ export { Table, TableHeader, TableBody, TableFooter, TableHead, TableRow, TableC
 // Complex Interactions
 export { ScrollArea, ScrollBar } from "./scroll-area"; // ~6KB - Custom scrollbars
 export { Drawer, DrawerPortal, DrawerOverlay, DrawerTrigger, DrawerClose, DrawerContent, DrawerHeader, DrawerFooter, DrawerTitle, DrawerDescription } from "./drawer"; // ~12KB - Bottom sheet drawer
-export { Carousel, CarouselContent, CarouselItem, CarouselPrevious, CarouselNext } from "./carousel"; // ~15KB - Image/content carousel (uses embla-carousel)
+export { Carousel, CarouselContent, CarouselItem } from "./carousel"; // ~15KB - Image/content carousel
 export { Calendar } from "./calendar"; // ~12KB - Date picker calendar (uses react-day-picker)
-export { Command, CommandDialog, CommandInput, CommandList, CommandEmpty, CommandGroup, CommandItem, CommandShortcut, CommandSeparator } from "./command"; // ~10KB - Command palette (uses cmdk)
-export { Pagination, PaginationContent, PaginationEllipsis, PaginationItem, PaginationLink, PaginationNext, PaginationPrevious } from "./pagination"; // ~5KB
+export { Command, CommandInput, CommandList, CommandEmpty, CommandGroup, CommandItem, CommandSeparator } from "./command"; // ~10KB - Command palette (uses cmdk)
+export { Pagination, PaginationEllipsis, PaginationLink, PaginationNext, PaginationPrevious } from "./pagination"; // ~5KB
 
 // Layout Components
-export { ResizablePanelGroup, ResizablePanel, ResizableHandle } from "./resizable"; // ~8KB - Resizable panels
+export { Resizable, ResizableHandle } from "./resizable"; // ~8KB - Resizable panels
 export { Sidebar, SidebarProvider, SidebarTrigger, SidebarInset, SidebarHeader, SidebarFooter, SidebarContent, SidebarGroup, SidebarGroupLabel, SidebarGroupAction, SidebarGroupContent, SidebarMenu, SidebarMenuItem, SidebarMenuButton, SidebarMenuAction, SidebarMenuSub, SidebarMenuSubItem, SidebarMenuSubButton, SidebarMenuBadge, SidebarSeparator, SidebarRail } from "./sidebar"; // ~10KB
 
 // Data Visualization
-export { ChartContainer, ChartTooltip, ChartTooltipContent, ChartLegend, ChartLegendContent, ChartStyle } from "./chart"; // ~20KB+ (requires recharts - very large!)
+export { Chart, ChartTooltip } from "./chart"; // ~20KB+ (requires recharts - very large!)
 
 // Notifications
 export { Toaster } from "./sonner"; // ~8KB - Toast notifications

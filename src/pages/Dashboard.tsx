@@ -93,14 +93,13 @@ type ScanRow = {
   fileName: string;
   verdict: "real" | "inconclusive" | "likely_ai" | "likely_deepfake" | "error" | null;
   confidence: number | null;
-  /** stored combined synthetic-leaning score */
   score: number | null;
   isPublic: boolean;
   pinned: boolean;
   createdAt: number;
   expiresAt: number;
   fileSize: number | null;
-};
+} & Partial<{ deviceId: string }>;
 
 /** The three outcomes plus the failure state. */
 const VERDICT_META: Record<

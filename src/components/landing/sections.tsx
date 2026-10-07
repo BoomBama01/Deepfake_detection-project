@@ -274,7 +274,7 @@ export function LiveSamples() {
       navigate(`/results/${out.id}`);
     } catch (err) {
       if (err instanceof QuotaError) toast.error(err.message);
-      else if (err instanceof AnalysisError) toast.error(err.message);
+      else if (err instanceof AnalysisError) toast.error(err.details ? `${err.message}: ${String(err.details)}` : err.message);
       else toast.error(err instanceof Error ? err.message : "Sample analysis failed.");
     } finally {
       setBusy(null);

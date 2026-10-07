@@ -51,14 +51,32 @@ export const getById = query({
   handler: (ctx, args) => ctx.db.get(args.id),
 });
 
+export const get = query({
+  args: { id: v.id("scans") },
+  handler: (ctx, args) => ctx.db.get(args.id),
+});
+
 export const listByUser = query({
-  args: { userId: v.id("users") },
+  args: { userId: v.id("users"), limit: v.optional(v.number()) },
   handler: (ctx, args) =>
     ctx.db
       .query("scans")
       .withIndex("by_user", (q) => q.eq("userId", args.userId))
       .order("desc")
-      .take(50),
+      .take(args.limit ?? 50),
+});
+
+export const listMine = query({
+  args: { limit: v.optional(v.number()) },
+  handler: async (ctx, args) => {
+    const userId = await getAuthUserId(ctx);
+    if (!userId) return [];
+    return ctx.db
+      .query("scans")
+      .withIndex("by_user", (q) => q.eq("userId", userId))
+      .order("desc")
+      .take(args.limit ?? 50);
+  },
 });
 
 export const listPublic = query({
@@ -71,12 +89,90 @@ export const listPublic = query({
       .take(20),
 });
 
+export const quota = query({
+  args: { deviceId: v.string() },
+  handler: async (ctx, args) => {
+    const userId = await getAuthUserId(ctx);
+    if (!userId) return { used: 0, limit: 2, plan: "free" };
+    const today = new Date();
+    today.setUTCHours(0, 0, 0, 0);
+    const day = today.toISOString().slice(0, 10);
+    let existing = await ctx.db
+      .query("guestQuota")
+      .withIndex("by_device_day", (q) => q.eq("deviceId", args.deviceId).eq("day", day))
+      .unique();
+    if (!existing) {
+      return { used: 0, limit: 25, plan: "free" };
+    }
+    const used = (existing as any).count ?? 0;
+    const user = await ctx.db.get(userId);
+    const planLimit = user?.plan === "pro" ? 500 : user?.plan === "team" ? 2000 : 25;
+    return { used, limit: planLimit, plan: user?.plan ?? "free" };
+  },
+});
+
 export const getPublicById = query({
   args: { id: v.id("scans") },
   handler: async (ctx, args) => {
     const doc = await ctx.db.get(args.id);
     if (!doc || doc.isPublic !== true) return null;
     return doc;
+  },
+});
+
+export const setVisibility = mutation({
+  args: { id: v.id("scans"), isPublic: v.boolean() },
+  handler: async (ctx, args) => {
+    const userId = await getAuthUserId(ctx);
+    if (!userId) throw new Error("Sign in first.");
+    const scan = await ctx.db.get(args.id);
+    if (!scan) throw new Error("Scan not found.");
+    if (scan.userId !== userId) throw new Error("Not your scan.");
+    await ctx.db.patch(args.id, { isPublic: args.isPublic });
+  },
+});
+
+export const setPinned = mutation({
+  args: { id: v.id("scans"), pinned: v.boolean() },
+  handler: async (ctx, args) => {
+    const userId = await getAuthUserId(ctx);
+    if (!userId) throw new Error("Sign in first.");
+    const scan = await ctx.db.get(args.id);
+    if (!scan) throw new Error("Scan not found.");
+    if (scan.userId !== userId) throw new Error("Not your scan.");
+    await ctx.db.patch(args.id, { pinned: args.pinned });
+  },
+});
+
+export const remove = mutation({
+  args: { id: v.id("scans") },
+  handler: async (ctx, args) => {
+    const userId = await getAuthUserId(ctx);
+    if (!userId) throw new Error("Sign in first.");
+    const scan = await ctx.db.get(args.id);
+    if (!scan) throw new Error("Scan not found.");
+    if (scan.userId !== userId) throw new Error("Not your scan.");
+    for (const id of [scan.previewId, scan.heatmapId, scan.elaId]) {
+      if (id) await ctx.storage.delete(id);
+    }
+    await ctx.db.delete(args.id);
+  },
+});
+
+export const removeMany = mutation({
+  args: { ids: v.array(v.id("scans")) },
+  handler: async (ctx, args) => {
+    const userId = await getAuthUserId(ctx);
+    if (!userId) throw new Error("Sign in first.");
+    for (const id of args.ids) {
+      const scan = await ctx.db.get(id);
+      if (scan && scan.userId === userId) {
+        for (const sid of [scan.previewId, scan.heatmapId, scan.elaId]) {
+          if (sid) await ctx.storage.delete(sid);
+        }
+        await ctx.db.delete(id);
+      }
+    }
   },
 });
 
@@ -132,9 +228,16 @@ export const apiQuotaFor = query({
 export const scans = {
   add,
   getById,
+  get,
   listByUser,
+  listMine,
   listPublic,
   getPublicById,
+  quota,
+  setVisibility,
+  setPinned,
+  remove,
+  removeMany,
   apiListFor,
   apiGetFor,
   apiQuotaFor,

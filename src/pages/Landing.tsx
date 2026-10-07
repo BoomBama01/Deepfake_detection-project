@@ -68,10 +68,9 @@ function HeroDrop() {
       setProgress({ stage: "validating", pct: 2, note: "Starting" });
       try {
         const out = await runFile(file, DEFAULT_SETTINGS, "upload", {
-          onProgress: setProgress,
-          onSaving: (_pct, note) => {
+          onProgress: (pct) => setProgress({ stage: "analyzing", pct, note: "Analyzing" }),
+          onSaving: () => {
             setProgress(null);
-            setSavingNote(note);
           },
           isCancelled: () => cancelled.current,
         });
@@ -84,7 +83,7 @@ function HeroDrop() {
         setSavingNote(null);
         if (err instanceof QuotaError) toast.error(err.message);
         else if (err instanceof AnalysisError)
-          toast.error(err.detail ? `${err.message} (${err.detail})` : err.message);
+          toast.error(err.details ? `${err.message} (${err.details})` : err.message);
         else if (err && (err as Error).name === "AnalysisCancelled") toast.info("Scan cancelled.");
         else toast.error(err instanceof Error ? err.message : "Analysis failed.");
       }
