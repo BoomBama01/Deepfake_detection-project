@@ -79,3 +79,63 @@ export const getPublicById = query({
     return doc;
   },
 });
+
+// ---- internal helpers for the read-only REST API (http.ts) ----
+
+/** List every scan this account owns, most recent first. For the public API. */
+export const apiListFor = query({
+  args: { userId: v.id("users") },
+  handler: (ctx, args) =>
+    ctx.db
+      .query("scans")
+      .withIndex("by_user", (q) => q.eq("userId", args.userId))
+      .order("desc")
+      .take(50),
+});
+
+/** Look up a single scan by id and re-check that it belongs to the requester. */
+export const apiGetFor = query({
+  args: { userId: v.id("users"), scanId: v.id("scans") },
+  handler: (ctx, args) => {
+    const doc = ctx.db.get(args.scanId);
+    if (!doc) return { status: "missing" as const, scan: null as any, message: "not found" };
+    if (doc.userId !== args.userId) {
+      return { status: "forbidden" as const, scan: null as any, message: "belongs to another account" };
+    }
+    return { status: "ok" as const, scan: doc, message: "owned" };
+  },
+});
+
+/** Current-day scan use for the guest quota (device-scoped). */
+export const apiQuotaFor = query({
+  args: { userId: v.optional(v.id("users")) },
+  handler: async (ctx, args) => {
+    const userId = args.userId;
+    if (!userId) return { used: 0, limit: 0 };
+    const today = new Date();
+    today.setUTCHours(0, 0, 0, 0);
+    const day = today.toISOString().slice(0, 10);
+    const now = Math.floor(Date.now() / 1000);
+    let existing = await ctx.db
+      .query("guestQuota")
+      .withIndex("by_device_day", (q) => q.eq("day", day))
+      .unique();
+    if (!existing) {
+      existing = await ctx.db.insert("guestQuota", { deviceId: "", day, count: 0 });
+    }
+    const used = existing.count ?? 0;
+    const limit = 2;
+    return { used, limit };
+  },
+});
+
+export const scans = {
+  add,
+  getById,
+  listByUser,
+  listPublic,
+  getPublicById,
+  apiListFor,
+  apiGetFor,
+  apiQuotaFor,
+};

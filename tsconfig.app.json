@@ -2,7 +2,10 @@
   "compilerOptions": {
     "tsBuildInfoFile": "../../../node_modules/.tmp/tsconfig.app.tsbuildinfo",
     "target": "ESNext",
-    "lib": ["ES2021", "dom"],
+    "lib": [
+      "ES2021",
+      "dom"
+    ],
     "module": "ESNext",
     "moduleResolution": "Bundler",
     "jsx": "react-jsx",
@@ -12,8 +15,12 @@
     "isolatedModules": true,
     "noEmit": true,
     "forceConsistentCasingInFileNames": true,
-    "types": ["vinejs-only-via-convex"]
+    "types": []
   },
-  "include": ["./**/*"],
-  "exclude": ["./_generated"]
+  "include": [
+    "./**/*"
+  ],
+  "exclude": [
+    "./_generated"
+  ]
 }
