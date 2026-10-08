@@ -46,7 +46,7 @@ import {
   WarningList,
 } from "@/components/results/parts";
 import { getDeviceId } from "@/lib/device";
-import { recallFile } from "@/lib/session";
+import { recallFile, rememberFile } from "@/lib/session";
 import type { Analysis, VideoAnalysis } from "@/lib/engine/types";
 import { THRESHOLDS } from "@/lib/engine/verdict";
 import { ForensicReportView } from "@/components/results/Report";
@@ -105,7 +105,10 @@ export default function Results() {
   const videoUrl = useMemo(() => {
     if (analysis?.kind !== "video") return null;
     const file = recallFile(id);
-    return file ? URL.createObjectURL(file) : null;
+    if (!file) {
+      return null;
+    }
+    return URL.createObjectURL(file);
   }, [analysis, id]);
 
   useEffect(() => {
@@ -114,9 +117,6 @@ export default function Results() {
   }, [videoUrl]);
 
   if (!valid) {
-    // Stale or malformed id in the URL (old link, truncated copy, foreign id):
-    // the query above is already skipped — clear the URL instead of showing a
-    // skeleton that never resolves.
     return <Navigate to="/analyze" replace />;
   }
 
@@ -131,9 +131,7 @@ export default function Results() {
         <Footer />
       </div>
     );
-  }
-
-  if (scan === null) {
+  }  if (scan === null) {
     return (
       <div className="flex min-h-screen flex-col">
         <Navbar variant="app" />
@@ -148,7 +146,7 @@ export default function Results() {
               Go back
             </Button>
             <Button asChild>
-              <a href="/analyze">Run a new examination</a>
+              <a href="/analyze" onClick={() => { try { sessionStorage.removeItem("truthlens-settings"); } catch { /* ignore */ } }}>Run a new examination</a>
             </Button>
           </div>
         </main>
@@ -186,13 +184,13 @@ export default function Results() {
             {scan.status === "error" ? "Analysis unavailable" : "Not yet analysed"}
           </h1>
           <p className="mt-3 font-body text-sm leading-6 text-muted-foreground">
-            {scan.note ?? 
+            {scan.note ??
               (scan.status === "error"
                 ? "This scan did not complete. Try re-analysing the file."
                 : "This scan has not been processed yet.")}
           </p>
           <Button asChild className="mt-6" variant="outline">
-            <a href={`/analyze?returnTo=/results/${id}`}>Re-analyse</a>
+            <a href={`/analyze?returnTo=/results/${id}`} onClick={() => { try { sessionStorage.setItem("truthlens-settings", scan.settings ?? ""); } catch { /* ignore */ } }}>Re-analyse</a>
           </Button>
         </main>
         <Footer />
@@ -209,9 +207,9 @@ export default function Results() {
           <p className="font-body text-sm text-muted-foreground">
             Stored result is unreadable.
           </p>
-          <Button asChild className="mt-4" variant="outline">
-            <a href="/analyze">Run a new examination</a>
-          </Button>
+         <Button asChild className="mt-4" variant="outline">
+          <a href="/analyze" onClick={() => { try { sessionStorage.removeItem("truthlens-settings"); } catch { /* ignore */ } }}>Run a new examination</a>
+        </Button>
         </main>
         <Footer />
       </div>
@@ -276,13 +274,6 @@ export default function Results() {
     }
   };
 
-  /* The engine reports three outcomes. Legacy rows stored before the
-     three-way engine carry no `outcome` field; `resolveOutcomeLabel` (used by
-     ForensicReportView) falls back from the verdict, so a legacy row is never
-     silently upgraded to a confident call. */
-  /* Legacy rows stored before the three-way engine carry no `outcome` field;
-     `resolveOutcomeLabel` (used by ForensicReportView) falls back from the
-     verdict, so an old row is never silently upgraded to a confident call. */
   const verdict = scan.verdict ?? analysis.verdict;
   const title = isVideo ? "Video examination" : "Image examination";
 
@@ -304,7 +295,6 @@ export default function Results() {
           </p>
         </div>
 
-        {/* the forensic report: verdict, confidence, uncertainty, evidence, reasoning */}
         <section className="mt-4">
           <ForensicReportView
             analysis={analysis}
@@ -314,7 +304,6 @@ export default function Results() {
           />
         </section>
 
-        {/* actions */}
         <div className="no-print mt-5 flex flex-wrap items-center gap-2">
           <Button variant="outline" size="sm" className="gap-1.5" onClick={downloadJson}>
             <FileJson2 className="size-4" /> Download JSON
@@ -414,7 +403,6 @@ export default function Results() {
           </AlertDialog>
         </div>
 
-        {/* tabs */}
         <Tabs value={tab} onValueChange={setTab} className="mt-6">
           <TabsList className="h-auto w-full flex-wrap justify-start">
             <TabsTrigger value="overview">Overview</TabsTrigger>
@@ -448,7 +436,6 @@ export default function Results() {
               <StatCard label="Content hash" value={analysis.hash ? `${analysis.hash.slice(0, 16)}…` : "—"} />
             </div>
 
-            {/* Honest AI-probability vs confidence split. */}
             <div className="rounded-lg border border-border bg-card p-4">
               <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
                 assessment summary
@@ -767,7 +754,6 @@ export default function Results() {
           </TabsContent>
         </Tabs>
 
-        {/* feedback */}
         <section className="no-print mt-10 rounded-lg border border-border bg-card p-5">
           <h3 className="font-display text-base font-semibold">Report incorrect result</h3>
           {existingFeedback && existingFeedback.length > 0 ? (

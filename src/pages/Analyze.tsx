@@ -38,6 +38,7 @@ import {
 import { formatBytes } from "@/lib/format";
 import { renderPreview, dataUrlToBlob } from "@/lib/engine/artifacts";
 import { getDeviceId } from "@/lib/device";
+import { rememberFile } from "@/lib/session";
 import type { Id } from "@/convex/_generated/dataModel";
 import type { DetectionResult } from "@/hooks/use-analysis";
 
@@ -221,19 +222,19 @@ export default function Analyze() {
       if (!storageId) throw new Error("Storage upload did not return an id.");        const analysis = out.analysis;
         const verdict = analysis?.verdict;
         const confidence = analysis?.confidence;
-        const createRes = await createScan({
+      const createRes = await createScan({
           type: file.type.startsWith("video") ? ("video" as const) : ("image" as const),
           source,
           fileName: file.name,
           status: "done",
           verdict: verdict ?? undefined,
           confidence: confidence ?? undefined,
-        settings: JSON.stringify(settings),
-        resultJson: JSON.stringify(analysis ?? {}),
-        deviceId: getDeviceId(),
-        previewId: storageId,
-        isPublic: false,
-      });
+          settings: JSON.stringify(settings),
+          resultJson: JSON.stringify(analysis ?? {}),
+          deviceId: getDeviceId(),
+          previewId: storageId,
+          isPublic: false,
+        });
       setSavingNote(null);
       return createRes;
     },
@@ -256,6 +257,7 @@ export default function Analyze() {
           return;
         }
         const scanId = await persistAnalysis(file, source, out);
+        rememberFile(scanId, file);
         navigate(`/results/${scanId}`);
       } catch (err) {
         setProgress(null);
