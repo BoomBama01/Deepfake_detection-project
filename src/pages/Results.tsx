@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useParams } from "react-router";
+import { Navigate, useNavigate, useParams } from "react-router";
 import { useMutation, useQuery } from "convex/react";
 import { toast } from "sonner";
 import {
@@ -66,6 +66,7 @@ const VALID_ID = /^[a-zA-Z0-9_-]{20,}$/;
 
 export default function Results() {
   const params = useParams();
+  const navigate = useNavigate();
   const id = params.id ?? "";
   const valid = VALID_ID.test(id);
   const deviceId = getDeviceId();
@@ -112,7 +113,14 @@ export default function Results() {
     return () => URL.revokeObjectURL(videoUrl);
   }, [videoUrl]);
 
-  if (!valid || scan === undefined) {
+  if (!valid) {
+    // Stale or malformed id in the URL (old link, truncated copy, foreign id):
+    // the query above is already skipped — clear the URL instead of showing a
+    // skeleton that never resolves.
+    return <Navigate to="/analyze" replace />;
+  }
+
+  if (scan === undefined) {
     return (
       <div className="flex min-h-screen flex-col">
         <Navbar variant="app" />
@@ -130,14 +138,19 @@ export default function Results() {
       <div className="flex min-h-screen flex-col">
         <Navbar variant="app" />
         <main className="mx-auto flex w-full max-w-lg flex-1 flex-col items-center justify-center px-6 py-20 text-center">
-          <h1 className="font-display text-2xl font-semibold">Result not found</h1>
+          <h1 className="font-display text-2xl font-semibold">Scan not found</h1>
           <p className="mt-3 font-body text-sm leading-6 text-muted-foreground">
             This result does not exist, was deleted, or is private and not yours. Media
             artifacts also expire 24 hours after analysis.
           </p>
-          <Button asChild className="mt-6">
-            <a href="/analyze">Run a new examination</a>
-          </Button>
+          <div className="mt-6 flex items-center justify-center gap-3">
+            <Button variant="outline" onClick={() => navigate(-1)}>
+              Go back
+            </Button>
+            <Button asChild>
+              <a href="/analyze">Run a new examination</a>
+            </Button>
+          </div>
         </main>
         <Footer />
       </div>

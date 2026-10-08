@@ -1,5 +1,6 @@
 import { v } from "convex/values";
 import { query, mutation, internalQuery } from "./_generated/server";
+import type { Id } from "./_generated/dataModel";
 import { getAuthUserId } from "@convex-dev/auth/server";
 import { auth } from "./auth";
 import { verdictValidator } from "./schema";
@@ -53,10 +54,22 @@ export interface ScanProfile {
   frameUrls: FrameArtifactRow[];
 }
 
+/**
+ * Stored timestamps are mixed: rows written by older code carry milliseconds,
+ * `scans.add` writes seconds. Normalise to milliseconds (what the frontend's
+ * `formatDate`/`timeAgo` expect) so both generations render correctly.
+ */
+function toMillis(ts: number | null | undefined): number {
+  if (ts == null || !Number.isFinite(ts)) return 0;
+  return ts > 1e12 ? ts : ts * 1000;
+}
+
 /** Derive whether the media artifacts are past expiry. */
 function mediaExpiredAt(expiresAt: number | null | undefined): boolean {
   if (expiresAt == null) return true;
-  return Date.now() > expiresAt * 1000;
+  const ms = toMillis(expiresAt);
+  if (ms === 0) return true;
+  return Date.now() > ms;
 }
 
 /** Map the raw status string (including legacy/"failed") onto the client enum. */
@@ -88,12 +101,26 @@ function statusNote(
 // Public queries
 // ---------------------------------------------------------------------------
 
-/** Fully-shaped, never-throwing query used by the Results page. */
+/**
+ * Fully-shaped, never-throwing query used by the Results page.
+ *
+ * IMPORTANT: `args.id` is deliberately `v.string()`, NOT `v.id("scans")`.
+ * Convex argument validators run BEFORE this handler, so a rejected id can
+ * never be caught by the try/catch below — the backend answers with the
+ * opaque `"[Request ID: …] Server Error"` and the client's useQuery throws it
+ * during render (the "Preview runtime error" crash). Any id that is not a
+ * plausible scans id is resolved to `null` here instead, which the Results
+ * page renders as its "Result not found" screen.
+ */
 export const get = query({
-  args: { id: v.id("scans") },
+  args: { id: v.string() },
   handler: async (ctx, args) => {
     try {
-      const doc = await ctx.db.get(args.id);
+      // Modern Convex ids are 32 lowercase base chars (legacy ones are 33);
+      // everything else (truncated, uppercase, UUIDs, foreign strings) would
+      // make ctx.db.get throw — normalise it to the missing-document case.
+      if (!/^[a-z0-9]{20,64}$/.test(args.id)) return null;
+      const doc = await ctx.db.get(args.id as Id<"scans">);
       if (!doc) return null;
 
       const status = normalizeStatus(doc.status);
@@ -124,8 +151,8 @@ export const get = query({
         confidence: doc.confidence ?? null,
         settings: doc.settings ?? null,
         resultJson: doc.resultJson ?? null,
-        createdAt: Number(doc.createdAt ?? 0),
-        expiresAt: Number(doc.expiresAt ?? 0),
+        createdAt: toMillis(doc.createdAt),
+        expiresAt: toMillis(doc.expiresAt),
         isPublic: Boolean(doc.isPublic),
         pinned: Boolean(doc.pinned),
         note: statusNote(status, hasResult, hasError),

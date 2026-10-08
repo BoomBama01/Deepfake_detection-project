@@ -98,6 +98,68 @@ class RootErrorBoundary extends React.Component<
 
 const convex = new ConvexReactClient(import.meta.env.VITE_CONVEX_URL as string);
 
+/**
+ * Route-level error boundary. Catches render errors below it — notably a
+ * Convex `useQuery` re-throwing a server error such as
+ * "[CONVEX Q(scans:get)] … Server Error" — and renders a friendly recovery UI
+ * instead of the raw crash panel, so the app never shows a blank screen.
+ * It is keyed by pathname, so navigating away resets it automatically.
+ */
+class RouteErrorBoundary extends React.Component<
+  { children: React.ReactNode; path: string },
+  { hasError: boolean }
+> {
+  state = { hasError: false };
+  static getDerivedStateFromError() {
+    return { hasError: true };
+  }
+  componentDidCatch(error: Error) {
+    console.error("[RouteBoundary] caught on", this.props.path, error);
+  }
+  render() {
+    if (!this.state.hasError) return this.props.children;
+    const isResults = this.props.path.startsWith("/results");
+    return (
+      <div className="flex min-h-screen flex-col items-center justify-center bg-background p-6 text-center text-foreground">
+        <div className="max-w-lg">
+          <h1 className="font-display text-2xl font-semibold">
+            {isResults ? "Scan not found" : "Something went wrong"}
+          </h1>
+          <p className="mt-3 font-body text-sm leading-6 text-muted-foreground">
+            {isResults
+              ? "This result could not be loaded — it may have been deleted, expired, or the link is out of date."
+              : "This page hit an unexpected error. Going back usually clears it."}
+          </p>
+          <div className="mt-6 flex flex-wrap items-center justify-center gap-3">
+            <button
+              type="button"
+              onClick={() => window.history.back()}
+              className="rounded-md border border-border bg-card px-4 py-2 font-body text-sm hover:bg-muted"
+            >
+              Go back
+            </button>
+            <a
+              href={isResults ? "/analyze" : "/"}
+              className="rounded-md border border-border bg-primary px-4 py-2 font-body text-sm text-primary-foreground hover:opacity-90"
+            >
+              {isResults ? "Run a new examination" : "Back to home"}
+            </a>
+          </div>
+        </div>
+      </div>
+    );
+  }
+}
+
+function RouteBoundary({ children }: { children: React.ReactNode }) {
+  const location = useLocation();
+  return (
+    <RouteErrorBoundary key={location.pathname} path={location.pathname}>
+      {children}
+    </RouteErrorBoundary>
+  );
+}
+
 // Global reload guard for Vite chunk-load failures.
 // This catches both Vite's own preloadError and any dynamic import that throws,
 // then reloads the page so the browser picks up the freshly deployed hashed chunks.
@@ -147,7 +209,8 @@ createRoot(document.getElementById("root")!).render(
         <BrowserRouter>
           <RouteSyncer />
           <Suspense fallback={<RouteLoading />}>
-            <Routes>
+            <RouteBoundary>
+              <Routes>
               <Route path="/" element={<Landing />} />
               <Route
                 path="/auth"
@@ -186,6 +249,7 @@ createRoot(document.getElementById("root")!).render(
               />
               <Route path="*" element={<NotFound />} />
             </Routes>
+            </RouteBoundary>
           </Suspense>
         </BrowserRouter>
         <Toaster />
